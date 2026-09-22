@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title id="doc-title">小树时光相册</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="/api/brand/icon" />
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css" />
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("xiaoshu_theme") || "fresh";
+        if (t !== "fresh" && t !== "cyber") t = "fresh";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <div class="grid-bg" aria-hidden="true"></div>
+  <header class="top">
+    <div class="brand" id="brand-block">
+      <img id="brand-icon" class="brand-mark brand-mark-lg" src="/api/brand/icon" alt="" width="72" height="72" />
+      <div>
+        <h1 id="brand-title">小树时光相册</h1>
+        <p class="tagline">轻量归档 · 元数据随图同行</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button type="button" class="tab active" data-section="browse">相册浏览</button>
+      <button type="button" class="tab" data-section="manage">相册管理</button>
+    </nav>
+    <div class="auth-bar">
+      <div id="auth-chip" class="auth-chip muted">
+        <span id="auth-role" class="auth-role">访客</span>
+        <span id="auth-who" class="auth-who">未登录</span>
+      </div>
+      <a class="btn ghost" id="btn-auth-open" href="/login">登录</a>
+      <button type="button" class="btn ghost hidden" id="btn-auth-logout">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="panel-browse" class="panel active">
+      <div class="panel-head">
+        <h2>相册浏览</h2>
+        <div class="actions">
+          <div class="seg" role="group" aria-label="浏览模式">
+            <button type="button" class="seg-btn active" data-view="journey">时光模式</button>
+            <button type="button" class="seg-btn" data-view="classic">经典模式</button>
+            <button type="button" class="seg-btn" data-view="map">地图模式</button>
+          </div>
+        </div>
+      </div>
+      <div id="browse-empty" class="empty hidden">相册里还没有照片，去「相册管理 → 入库」吧。</div>
+      <div id="journey-root" class="journey"></div>
+      <div id="classic-root" class="classic hidden" aria-label="经典模式"></div>
+      <div id="map-root" class="map-root hidden">
+        <div class="map-toolbar">
+          <span id="map-status" class="muted"></span>
+          <button type="button" id="btn-refresh-map" class="btn ghost">刷新</button>
+        </div>
+        <div class="map-stage">
+          <div id="album-map" class="album-map"></div>
+          <aside id="map-expand" class="map-expand hidden" aria-live="polite">
+            <div class="map-expand-head">
+              <div>
+                <strong id="map-expand-title">地点</strong>
+                <p id="map-expand-sub" class="muted"></p>
+              </div>
+              <button type="button" id="map-expand-close" class="btn ghost">收起</button>
+            </div>
+            <div id="map-expand-grid" class="map-expand-grid"></div>
+          </aside>
+        </div>
+        <p class="hint map-hint">按元数据聚成照片堆，点击堆叠展开该地点图集。默认国内高德底图（免注册），断网可用离线包。</p>
+      </div>
+    </section>
+
+    <section id="panel-manage" class="panel">
+      <div class="panel-head">
+        <h2>相册管理</h2>
+        <div class="actions">
+          <div class="seg" role="group" aria-label="管理功能">
+            <button type="button" class="seg-btn active" data-manage="album">相册</button>
+            <button type="button" class="seg-btn" data-manage="import">入库</button>
+            <button type="button" class="seg-btn" data-manage="trash">回收站</button>
+            <button type="button" class="seg-btn" data-manage="settings">设置</button>
+            <button type="button" class="seg-btn" data-manage="visitors">访问数据</button>
+            <button type="button" class="seg-btn" data-manage="about">关于</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="manage-album" class="manage-pane">
+        <div id="tree-empty" class="empty hidden">相册里还没有照片，去「入库」吧。</div>
+        <div id="tree-root" class="tree"></div>
+      </div>
+
+      <div id="manage-import" class="manage-pane hidden">
+        <p class="hint" id="import-hint">
+          支持手机/平板相册导入（含苹果 HEIC、实况照片、MOV）。原件按字节拷贝入库，不转码、不压画质；元数据从 EXIF/侧车读取。
+          可拖放到下方区域，或点「从相册选择 / 选择文件夹」。不想入库的项：勾选后点「移除选中」，或「清空待入库」。
+        </p>
+        <div id="drop-zone" class="drop-zone" tabindex="0">
+          <p class="drop-title" id="drop-title">拖放图片 / 视频或文件夹到这里</p>
+          <p class="drop-sub" id="drop-sub">支持 JPEG / HEIC / PNG / MOV / MP4 等，或整个目录</p>
+          <div class="drop-actions">
+            <button type="button" id="btn-pick-files" class="btn primary">从相册选择</button>
+            <button type="button" id="btn-pick-dir" class="btn ghost">选择文件夹</button>
+          </div>
+          <p id="drop-status" class="drop-status"></p>
+        </div>
+        <input
+          type="file"
+          id="file-input"
+          accept="image/*,video/*,.heic,.heif,.jpg,.jpeg,.png,.webp,.tif,.tiff,.bmp,.mp4,.mov,.m4v,.webm,.mkv,.avi,.mpeg,.mpg,.3gp"
+          multiple
+          hidden
+        />
+        <input type="file" id="dir-input" webkitdirectory multiple hidden />
+        <div id="import-empty" class="empty hidden">暂无待入库媒体，先拖入或选择文件。</div>
+        <div class="import-toolbar">
+          <label><input type="checkbox" id="check-all" /> 全选</label>
+          <button type="button" id="btn-select-same-day" class="btn ghost">勾选同日</button>
+          <button type="button" id="btn-parse" class="btn ghost">解析源数据</button>
+          <button type="button" id="btn-batch-import" class="btn ghost">批量编辑选中</button>
+          <button type="button" id="btn-reload-import" class="btn ghost">刷新列表</button>
+          <button type="button" id="btn-discard-import" class="btn ghost">移除选中</button>
+          <button type="button" id="btn-clear-import" class="btn ghost">清空待入库</button>
+          <button type="button" id="btn-ingest" class="btn primary">入库选中项</button>
+          <span id="import-count" class="muted"></span>
+        </div>
+        <div id="import-list" class="import-list"></div>
+        <pre id="import-log" class="log hidden"></pre>
+      </div>
+
+      <div id="manage-trash" class="manage-pane hidden">
+        <div class="trash-toolbar">
+          <div class="seg" role="group" aria-label="回收站排序">
+            <button type="button" class="seg-btn active" data-trash-sort="deleted_at">删除时间</button>
+            <button type="button" class="seg-btn" data-trash-sort="media_datetime">拍摄时间</button>
+          </div>
+          <div class="actions trash-actions">
+            <button type="button" id="btn-trash-select" class="btn ghost">选择</button>
+            <button type="button" id="btn-trash-restore" class="btn ghost hidden">恢复</button>
+            <button type="button" id="btn-trash-purge" class="btn ghost hidden">彻底删除</button>
+            <button type="button" id="btn-trash-refresh" class="btn ghost">刷新</button>
+          </div>
+        </div>
+        <p class="hint">删除的照片会先到这里。可恢复回原路径，或彻底删除（不可恢复）。</p>
+        <div id="trash-empty" class="empty hidden">回收站是空的。</div>
+        <div id="trash-grid" class="photo-grid trash-grid" aria-label="回收站"></div>
+      </div>
+
+      <div id="manage-settings" class="manage-pane hidden">
+        <form id="settings-form" class="settings">
+          <div class="settings-block" id="settings-auth">
+            <div class="settings-label">超级用户</div>
+            <p class="settings-desc">创建后，设置与分享仅超级用户可进；访客可通过分享二维码进入（无需账号，但权限严格按分享范围）。</p>
+            <div id="auth-setup-box" class="auth-form hidden">
+              <label class="field">
+                <span class="field-label">用户名</span>
+                <input type="text" id="auth-setup-user" value="admin" maxlength="32" autocomplete="username" />
+              </label>
+              <label class="field">
+                <span class="field-label">密码</span>
+                <div class="pw-wrap">
+                  <input type="password" id="auth-setup-pass" maxlength="64" autocomplete="new-password" aria-describedby="auth-setup-hint" placeholder="至少 8 位，字母+数字/符号" />
+                  <button type="button" class="pw-toggle" data-for="auth-setup-pass" aria-label="显示密码" aria-pressed="false" title="显示密码">
+                    <svg class="pw-eye pw-eye-open" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5c-5 0-9.27 3.11-11 7 1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>
+                    <svg class="pw-eye pw-eye-off" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" hidden><path fill="currentColor" d="M2.1 3.51 3.5 2.1l18.4 18.4-1.41 1.41-3.13-3.13A12.3 12.3 0 0 1 12 19c-5 0-9.27-3.11-11-7a13.4 13.4 0 0 1 4.2-4.95L2.1 3.51zM12 7a5 5 0 0 1 4.9 4.05l-1.57-1.57A2.5 2.5 0 0 0 12.5 8.1L12 7zm0 10c1.1 0 2.14-.23 3.1-.64l-1.6-1.6A2.5 2.5 0 0 1 9.6 11.9l-1.7-1.7A5 5 0 0 0 12 17zM12 5c5 0 9.27 3.11 11 7a13.3 13.3 0 0 1-3.05 3.95l-1.45-1.45A11.2 11.2 0 0 0 21.1 12C19.5 8.7 16 7 12 7c-.55 0-1.08.05-1.6.14L8.9 5.64C9.87 5.23 10.92 5 12 5z"/></svg>
+                  </button>
+                </div>
+              </label>
+              <label class="field">
+                <span class="field-label">确认密码</span>
+                <div class="pw-wrap">
+                  <input type="password" id="auth-setup-pass2" maxlength="64" autocomplete="new-password" placeholder="再次输入密码" />
+                  <button type="button" class="pw-toggle" data-for="auth-setup-pass2" aria-label="显示密码" aria-pressed="false" title="显示密码">
+                    <svg class="pw-eye pw-eye-open" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5c-5 0-9.27 3.11-11 7 1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>
+                    <svg class="pw-eye pw-eye-off" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" hidden><path fill="currentColor" d="M2.1 3.51 3.5 2.1l18.4 18.4-1.41 1.41-3.13-3.13A12.3 12.3 0 0 1 12 19c-5 0-9.27-3.11-11-7a13.4 13.4 0 0 1 4.2-4.95L2.1 3.51zM12 7a5 5 0 0 1 4.9 4.05l-1.57-1.57A2.5 2.5 0 0 0 12.5 8.1L12 7zm0 10c1.1 0 2.14-.23 3.1-.64l-1.6-1.6A2.5 2.5 0 0 1 9.6 11.9l-1.7-1.7A5 5 0 0 0 12 17zM12 5c5 0 9.27 3.11 11 7a13.3 13.3 0 0 1-3.05 3.95l-1.45-1.45A11.2 11.2 0 0 0 21.1 12C19.5 8.7 16 7 12 7c-.55 0-1.08.05-1.6.14L8.9 5.64C9.87 5.23 10.92 5 12 5z"/></svg>
+                  </button>
+                </div>
+              </label>
+              <div class="pw-meter" aria-hidden="true"><i id="auth-setup-meter"></i></div>
+              <ul id="auth-setup-hint" class="pw-rules">
+                <li data-rule="len">至少 8 位</li>
+                <li data-rule="classes">字母与数字（或符号）至少两类</li>
+                <li data-rule="space">首尾无空格</li>
+                <li data-rule="match">两次输入一致</li>
+              </ul>
+              <button type="button" class="btn primary" id="btn-auth-setup">创建超级用户</button>
+              <p id="auth-setup-msg" class="muted"></p>
+            </div>
+            <div id="auth-admin-box" class="auth-form hidden">
+              <p id="auth-admin-status" class="muted"></p>
+              <label class="field">
+                <span class="field-label">原密码</span>
+                <div class="pw-wrap">
+                  <input type="password" id="auth-old-pass" maxlength="64" autocomplete="current-password" placeholder="当前密码" />
+                  <button type="button" class="pw-toggle" data-for="auth-old-pass" aria-label="显示密码" aria-pressed="false" title="显示密码">
+                    <svg class="pw-eye pw-eye-open" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5c-5 0-9.27 3.11-11 7 1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>
+                    <svg class="pw-eye pw-eye-off" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" hidden><path fill="currentColor" d="M2.1 3.51 3.5 2.1l18.4 18.4-1.41 1.41-3.13-3.13A12.3 12.3 0 0 1 12 19c-5 0-9.27-3.11-11-7a13.4 13.4 0 0 1 4.2-4.95L2.1 3.51zM12 7a5 5 0 0 1 4.9 4.05l-1.57-1.57A2.5 2.5 0 0 0 12.5 8.1L12 7zm0 10c1.1 0 2.14-.23 3.1-.64l-1.6-1.6A2.5 2.5 0 0 1 9.6 11.9l-1.7-1.7A5 5 0 0 0 12 17zM12 5c5 0 9.27 3.11 11 7a13.3 13.3 0 0 1-3.05 3.95l-1.45-1.45A11.2 11.2 0 0 0 21.1 12C19.5 8.7 16 7 12 7c-.55 0-1.08.05-1.6.14L8.9 5.64C9.87 5.23 10.92 5 12 5z"/></svg>
+                  </button>
+                </div>
+              </label>
+              <label class="field">
+                <span class="field-label">新密码</span>
+                <div class="pw-wrap">
+                  <input type="password" id="auth-new-pass" maxlength="64" autocomplete="new-password" aria-describedby="auth-pass-hint" placeholder="至少 8 位，字母+数字/符号" />
+                  <button type="button" class="pw-toggle" data-for="auth-new-pass" aria-label="显示密码" aria-pressed="false" title="显示密码">
+                    <svg class="pw-eye pw-eye-open" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5c-5 0-9.27 3.11-11 7 1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>
+                    <svg class="pw-eye pw-eye-off" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" hidden><path fill="currentColor" d="M2.1 3.51 3.5 2.1l18.4 18.4-1.41 1.41-3.13-3.13A12.3 12.3 0 0 1 12 19c-5 0-9.27-3.11-11-7a13.4 13.4 0 0 1 4.2-4.95L2.1 3.51zM12 7a5 5 0 0 1 4.9 4.05l-1.57-1.57A2.5 2.5 0 0 0 12.5 8.1L12 7zm0 10c1.1 0 2.14-.23 3.1-.64l-1.6-1.6A2.5 2.5 0 0 1 9.6 11.9l-1.7-1.7A5 5 0 0 0 12 17zM12 5c5 0 9.27 3.11 11 7a13.3 13.3 0 0 1-3.05 3.95l-1.45-1.45A11.2 11.2 0 0 0 21.1 12C19.5 8.7 16 7 12 7c-.55 0-1.08.05-1.6.14L8.9 5.64C9.87 5.23 10.92 5 12 5z"/></svg>
+                  </button>
+                </div>
+              </label>
+              <label class="field">
+                <span class="field-label">确认新密码</span>
+                <div class="pw-wrap">
+                  <input type="password" id="auth-new-pass2" maxlength="64" autocomplete="new-password" placeholder="再次输入新密码" />
+                  <button type="button" class="pw-toggle" data-for="auth-new-pass2" aria-label="显示密码" aria-pressed="false" title="显示密码">
+                    <svg class="pw-eye pw-eye-open" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5c-5 0-9.27 3.11-11 7 1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>
+                    <svg class="pw-eye pw-eye-off" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" hidden><path fill="currentColor" d="M2.1 3.51 3.5 2.1l18.4 18.4-1.41 1.41-3.13-3.13A12.3 12.3 0 0 1 12 19c-5 0-9.27-3.11-11-7a13.4 13.4 0 0 1 4.2-4.95L2.1 3.51zM12 7a5 5 0 0 1 4.9 4.05l-1.57-1.57A2.5 2.5 0 0 0 12.5 8.1L12 7zm0 10c1.1 0 2.14-.23 3.1-.64l-1.6-1.6A2.5 2.5 0 0 1 9.6 11.9l-1.7-1.7A5 5 0 0 0 12 17zM12 5c5 0 9.27 3.11 11 7a13.3 13.3 0 0 1-3.05 3.95l-1.45-1.45A11.2 11.2 0 0 0 21.1 12C19.5 8.7 16 7 12 7c-.55 0-1.08.05-1.6.14L8.9 5.64C9.87 5.23 10.92 5 12 5z"/></svg>
+                  </button>
+                </div>
+              </label>
+              <div class="pw-meter" aria-hidden="true"><i id="auth-pass-meter"></i></div>
+              <ul id="auth-pass-hint" class="pw-rules">
+                <li data-rule="len">至少 8 位</li>
+                <li data-rule="classes">字母与数字（或符号）至少两类</li>
+                <li data-rule="space">首尾无空格</li>
+                <li data-rule="match">两次输入一致</li>
+              </ul>
+              <button type="button" class="btn primary" id="btn-auth-pass">修改密码</button>
+              <p id="auth-pass-msg" class="muted"></p>
+            </div>
+          </div>
+          <div class="settings-block" id="settings-shares">
+            <div class="settings-label">分享相册</div>
+            <p class="settings-desc">生成二维码：局域网设备扫码即可打开（无需登录）。必须勾选年份或具体媒资，访客无法越权访问其它文件。</p>
+            <div class="share-create">
+              <label class="field">
+                <span class="field-label">备注</span>
+                <input type="text" id="share-label" maxlength="40" placeholder="如：家人只读" />
+              </label>
+              <div class="share-perms">
+                <label class="check"><input type="checkbox" id="share-can-edit" /> 允许编辑</label>
+                <label class="check"><input type="checkbox" id="share-can-upload" /> 允许入库</label>
+                <label class="field share-expires-field">
+                  <span class="field-label">有效天数</span>
+                  <div class="share-expires-row">
+                    <input type="number" id="share-expires" min="0" max="365" placeholder="例如 7" />
+                    <span class="muted share-expires-hint">留空表示不过期</span>
+                  </div>
+                </label>
+              </div>
+              <div class="share-mode-seg" role="tablist" aria-label="分享范围">
+                <button type="button" class="seg-btn active" data-share-mode="years">按年份相册</button>
+                <button type="button" class="seg-btn" data-share-mode="media">勾选图片/视频</button>
+              </div>
+              <div id="share-years-box" class="share-pick-box">
+                <p class="muted share-pick-hint">点击选择可分享的年份（可多选）</p>
+                <div id="share-year-chips" class="share-chips"></div>
+              </div>
+              <div id="share-media-box" class="share-pick-box hidden">
+                <p class="muted share-pick-hint">从相册勾选要分享的图片或视频（可多选）</p>
+                <div class="share-media-toolbar">
+                  <button type="button" class="btn ghost" id="btn-share-media-reload">刷新列表</button>
+                  <span id="share-media-count" class="muted">已选 0</span>
+                </div>
+                <div id="share-media-grid" class="share-media-grid"></div>
+              </div>
+              <button type="button" class="btn primary" id="btn-share-create">生成分享二维码</button>
+              <p id="share-msg" class="muted"></p>
+            </div>
+            <div id="share-list" class="share-list"></div>
+          </div>
+          <div class="settings-block" id="settings-index">
+            <div class="settings-label">媒资索引</div>
+            <p class="settings-desc">时间线与地图优先读 SQLite 索引，减少扫盘，浏览更流畅。</p>
+            <p id="index-status" class="muted">—</p>
+            <button type="button" class="btn ghost" id="btn-index-rebuild">重建索引</button>
+          </div>
+          <div class="settings-block" id="settings-brand">
+            <div class="settings-label">相册名称与图标</div>
+            <p class="settings-desc">显示在页眉与浏览器标题。可换自己的图标（建议方形 PNG/SVG）。</p>
+            <div class="brand-settings">
+              <img id="settings-brand-preview" class="brand-preview" src="/api/brand/icon" alt="图标预览" width="64" height="64" />
+              <div class="brand-settings-fields">
+                <label>名称 <input type="text" id="input-album-title" name="album_title" maxlength="40" placeholder="小树时光相册" /></label>
+                <div class="settings-actions brand-actions">
+                  <button type="button" class="btn primary brand-action-btn" id="btn-album-title-save">保存名称</button>
+                  <label class="btn ghost brand-action-btn brand-icon-pick">
+                    更换图标
+                    <input type="file" id="input-album-icon" accept="image/png,image/jpeg,image/webp,image/svg+xml,image/gif,.ico" hidden />
+                  </label>
+                  <button type="button" class="btn ghost brand-action-btn" id="btn-album-icon-reset">恢复默认图标</button>
+                </div>
+                <p id="brand-msg" class="muted"></p>
+              </div>
+            </div>
+          </div>
+          <div class="settings-block" id="settings-album-root">
+            <div class="settings-label">相册根目录</div>
+            <p class="settings-desc">
+              照片按「年/月」归档在此目录（与程序、缩略图缓存分离）。
+              改路径后点「应用并迁移」，会把已有 <code>YYYY/</code> 年份文件夹搬到新位置；浏览与缩略图继续可用。
+            </p>
+            <p id="album-root-status" class="muted album-root-status">加载中…</p>
+            <input type="text" name="album_root" id="input-album-root" autocomplete="off" placeholder="/path/to/album" />
+            <div class="settings-actions" style="margin-top:0.75rem">
+              <button type="button" class="btn primary" id="btn-album-root-apply">应用并迁移</button>
+              <p id="album-root-msg" class="muted"></p>
+            </div>
+          </div>
+          <div class="settings-block" id="settings-thumb-root">
+            <div class="settings-label">缩略图缓存目录</div>
+            <p class="settings-desc">
+              列表与预览用的缩略图缓存在此目录，文件会随相册增多而变大。
+              可迁到外接硬盘；改路径后点「应用并迁移」会搬迁已有缓存（未搬迁的会在浏览时自动重新生成）。
+            </p>
+            <p id="thumb-root-status" class="muted album-root-status">加载中…</p>
+            <input type="text" name="thumb_root" id="input-thumb-root" autocomplete="off" placeholder="/path/to/thumbs" />
+            <div class="settings-actions" style="margin-top:0.75rem">
+              <button type="button" class="btn primary" id="btn-thumb-root-apply">应用并迁移</button>
+              <p id="thumb-root-msg" class="muted"></p>
+            </div>
+          </div>
+          <div class="settings-block">
+            <div class="settings-label">主题风格</div>
+            <p class="settings-desc">选择界面外观，点击即可切换（仅保存在本机浏览器）。</p>
+            <div class="theme-cards" role="radiogroup" aria-label="主题风格">
+              <label class="theme-card">
+                <input type="radio" name="theme" value="fresh" checked />
+                <span class="theme-card-face theme-card-fresh">
+                  <span class="theme-card-swatch"></span>
+                  <span class="theme-card-name">科技清新</span>
+                  <span class="theme-card-tip">浅色 · 清爽网格</span>
+                </span>
+              </label>
+              <label class="theme-card">
+                <input type="radio" name="theme" value="cyber" />
+                <span class="theme-card-face theme-card-cyber">
+                  <span class="theme-card-swatch"></span>
+                  <span class="theme-card-name">科技赛博</span>
+                  <span class="theme-card-tip">深蓝青 · 参考 GXTEST</span>
+                </span>
+              </label>
+            </div>
+          </div>
+          <div class="settings-block" id="settings-map">
+            <div class="settings-label">地图底图</div>
+            <p class="settings-desc">
+              默认<strong>高德在线</strong>（国内快、免注册，本机代理缓存）。
+              断网或想纯本地时选<strong>离线包</strong>。
+            </p>
+            <label class="settings-key-label" for="input-map-provider">底图模式</label>
+            <select id="input-map-provider" name="map_provider">
+              <option value="auto">自动（高德在线）</option>
+              <option value="amap">高德在线</option>
+              <option value="offline">离线包</option>
+            </select>
+            <div class="settings-actions" style="margin-top:0.75rem">
+              <button type="button" class="btn primary" id="btn-map-provider-save">保存地图设置</button>
+              <p id="map-provider-msg" class="muted"></p>
+            </div>
+            <div class="settings-label" style="margin-top:1.1rem; font-size:0.95rem">离线地图包</div>
+            <p class="settings-desc">「离线包」模式使用。点「更新地图包」可联网补全本地瓦片。</p>
+            <div id="map-pack-status" class="map-pack-status">加载状态…</div>
+            <div class="settings-actions" style="margin-top:0.85rem">
+              <button type="button" id="btn-map-pack-update" class="btn primary">更新地图包</button>
+              <p id="map-pack-msg" class="muted"></p>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <div id="manage-visitors" class="manage-pane hidden">
+        <div class="settings">
+          <div class="settings-block" id="visitors-page">
+            <div class="settings-label">访问数据</div>
+            <p class="settings-desc">
+              记录访问来源、IP；同网段时尽量解析 MAC。可查看当前在线、历史、访问曲线、入库占比、高频图片，并管理黑名单。
+            </p>
+            <div class="settings-actions" style="margin:0.4rem 0 0.75rem; gap:0.4rem; flex-wrap:wrap">
+              <button type="button" class="btn ghost" id="btn-visitors-refresh">刷新</button>
+              <p id="visitor-msg" class="muted"></p>
+            </div>
+            <div id="visitor-summary" class="muted album-root-status">加载中…</div>
+            <div class="visitor-panels">
+              <div class="visitor-panel visitor-panel-curve">
+                <div class="settings-label" style="font-size:0.95rem">访问曲线（近 14 天）</div>
+                <div id="visitor-curve" class="visitor-curve" aria-label="访问曲线"></div>
+              </div>
+              <div class="visitor-panel visitor-panel-curve">
+                <div class="settings-label" style="font-size:0.95rem">入库占比（按用户）</div>
+                <div id="visitor-upload-pie" class="visitor-pie" aria-label="入库占比"></div>
+                <div id="visitor-upload-legend" class="visitor-pie-legend muted"></div>
+              </div>
+              <div class="visitor-panel">
+                <div class="settings-label" style="font-size:0.95rem">入库记录</div>
+                <div id="visitor-uploads" class="visitor-table-wrap muted">—</div>
+              </div>
+              <div class="visitor-panel">
+                <div class="settings-label" style="font-size:0.95rem">当前访客（约 5 分钟内）</div>
+                <div id="visitor-current" class="visitor-table-wrap muted">—</div>
+              </div>
+              <div class="visitor-panel">
+                <div class="settings-label" style="font-size:0.95rem">高频图片</div>
+                <div id="visitor-hot" class="visitor-table-wrap muted">—</div>
+              </div>
+              <div class="visitor-panel">
+                <div class="settings-label" style="font-size:0.95rem">历史访客</div>
+                <div id="visitor-history" class="visitor-table-wrap muted">—</div>
+              </div>
+              <div class="visitor-panel">
+                <div class="settings-label" style="font-size:0.95rem">黑名单</div>
+                <div class="bl-form">
+                  <div class="seg bl-kind-seg" role="group" aria-label="黑名单类型">
+                    <button type="button" class="seg-btn active" data-bl-kind="ip">IP</button>
+                    <button type="button" class="seg-btn" data-bl-kind="mac">MAC</button>
+                  </div>
+                  <input type="hidden" id="bl-kind" value="ip" />
+                  <input type="text" id="bl-value" class="bl-input" placeholder="输入 IP，如 192.168.1.8" autocomplete="off" />
+                  <input type="text" id="bl-reason" class="bl-input" placeholder="原因（可选）" autocomplete="off" />
+                  <button type="button" class="btn primary" id="btn-bl-add">加入黑名单</button>
+                </div>
+                <div id="visitor-blacklist" class="visitor-table-wrap muted">—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="manage-about" class="manage-pane hidden">
+        <div class="about-page">
+          <header class="about-hero">
+            <div>
+              <h2 class="about-hero-title">小树时光相册 <span class="about-ver">v1.0</span></h2>
+              <p class="about-author muted">作者 · xiaoshu</p>
+            </div>
+          </header>
+
+          <section class="about-section" aria-labelledby="about-intro-title">
+            <h3 id="about-intro-title" class="about-section-title">简介</h3>
+            <p class="about-desc about-box">
+              局域网轻量相册：把照片/视频按时间归档到本机目录，元数据写进文件，支持时光浏览、地图足迹、入库整理、回收站与扫码分享。
+            </p>
+          </section>
+
+          <section class="about-section" aria-labelledby="about-feat-title">
+            <h3 id="about-feat-title" class="about-section-title">主要功能</h3>
+            <ul class="about-features">
+              <li>相册浏览：时光 / 经典 / 地图（高德或离线包）</li>
+              <li>入库整理：解析元数据、批量修正、按规范命名</li>
+              <li>单图编辑：旋转裁剪、视频剪辑封面、旁白录音</li>
+              <li>超级用户与分享二维码（免登、范围权限）</li>
+              <li>回收站软删除；媒资 SQLite 索引加速浏览</li>
+            </ul>
+            <p class="muted about-note">文件命名：<code>年/月/YYYY-MM-DD-HHMMSS-简述-md5.扩展名</code></p>
+          </section>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 沉浸式看图（单击进入）；编辑从右上角进入 -->
+  <dialog id="lightbox" class="lightbox" aria-label="看图">
+    <header class="lb-top">
+      <button type="button" class="lb-icon-btn" id="lb-close" aria-label="关闭">×</button>
+      <div class="lb-top-mid">
+        <strong id="lb-title">照片</strong>
+        <span id="lb-counter" class="lb-counter muted"></span>
+      </div>
+      <div class="lb-top-right">
+        <button type="button" class="lb-text-btn" id="lb-play" aria-pressed="false">播放</button>
+        <button type="button" class="lb-text-btn" id="lb-play-settings" title="播放设置">设置</button>
+        <button type="button" class="lb-text-btn" id="lb-edit">编辑</button>
+      </div>
+    </header>
+    <div class="lb-play-panel hidden" id="lb-play-panel" role="dialog" aria-label="自动播放设置">
+      <div class="lb-play-panel-title">自动播放设置</div>
+      <label class="lb-play-field">
+        <span>切换模式</span>
+        <select id="lb-play-mode">
+          <option value="fade">淡入淡出</option>
+          <option value="slide">左右滑入</option>
+          <option value="cut">直接切换</option>
+        </select>
+      </label>
+      <label class="lb-play-field">
+        <span>每张时长</span>
+        <select id="lb-play-duration">
+          <option value="2">2 秒</option>
+          <option value="3" selected>3 秒</option>
+          <option value="5">5 秒</option>
+          <option value="8">8 秒</option>
+          <option value="10">10 秒</option>
+          <option value="15">15 秒</option>
+        </select>
+      </label>
+      <label class="lb-play-check">
+        <input type="checkbox" id="lb-play-loop" checked />
+        <span>播完后循环</span>
+      </label>
+      <label class="lb-play-check">
+        <input type="checkbox" id="lb-play-narration" checked />
+        <span>播放旁白（有旁白时按时长切换）</span>
+      </label>
+      <p class="lb-play-tip muted">视频会播完再切下一张；关闭旁白后按上方「每张时长」切图。</p>
+      <button type="button" class="lb-text-btn" id="lb-play-panel-close">完成</button>
+    </div>
+    <div class="lb-stage-wrap" id="lb-stage-wrap">
+      <button type="button" class="lb-nav lb-prev" id="lb-prev" aria-label="上一张">‹</button>
+      <div class="lb-viewport" id="lb-viewport">
+        <div class="lb-fx" id="lb-fx">
+          <div class="lb-stage" id="lb-stage">
+            <img id="lb-img" alt="" draggable="false" />
+            <video id="lb-video" class="hidden" controls playsinline preload="metadata"></video>
+          </div>
+        </div>
+      </div>
+      <button type="button" class="lb-nav lb-next" id="lb-next" aria-label="下一张">›</button>
+    </div>
+    <div class="lb-progress hidden" id="lb-progress" aria-hidden="true"><i id="lb-progress-bar"></i></div>
+    <p class="lb-hint muted" id="lb-hint">左右滑动翻图 · 双击放大 · 捏合缩放</p>
+  </dialog>
+
+  <dialog id="auth-dialog" class="dialog slim hidden" hidden>
+    <!-- 登录已迁至 /login；保留节点以免旧脚本报错 -->
+  </dialog>
+
+  <dialog id="detail-dialog" class="dialog">
+    <form method="dialog" class="dialog-bar">
+      <strong id="detail-title">编辑</strong>
+      <button type="submit" class="btn ghost" value="close" id="btn-detail-close">关闭</button>
+    </form>
+    <div class="detail-grid">
+      <div class="detail-view">
+        <div id="viewer" class="viewer">
+          <div id="viewer-stage" class="viewer-stage">
+            <img id="detail-img" alt="" draggable="false" />
+            <video id="detail-video" class="hidden" controls playsinline preload="metadata"></video>
+          <div id="crop-mask" class="crop-mask hidden" aria-hidden="true">
+              <div class="crop-shade crop-shade-t"></div>
+              <div class="crop-shade crop-shade-b"></div>
+              <div class="crop-shade crop-shade-l"></div>
+              <div class="crop-shade crop-shade-r"></div>
+              <div id="crop-rect" class="crop-rect">
+                <span class="handle nw" data-handle="nw"></span>
+                <span class="handle ne" data-handle="ne"></span>
+                <span class="handle sw" data-handle="sw"></span>
+                <span class="handle se" data-handle="se"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="edit-tools" id="edit-tools-image">
+          <button type="button" id="btn-zoom-out" class="btn ghost">缩小</button>
+          <button type="button" id="btn-zoom-in" class="btn ghost">放大</button>
+          <button type="button" id="btn-zoom-reset" class="btn ghost">适配</button>
+          <button type="button" id="btn-rot-left" class="btn ghost">左转 90°</button>
+          <button type="button" id="btn-rot-right" class="btn ghost">右转 90°</button>
+          <button type="button" id="btn-crop-toggle" class="btn ghost">裁剪框</button>
+        </div>
+        <div class="edit-tools hidden" id="edit-tools-video">
+          <div class="video-tool-row">
+            <button type="button" id="btn-v-rot-left" class="btn ghost">左转 90°</button>
+            <button type="button" id="btn-v-rot-right" class="btn ghost">右转 90°</button>
+            <button type="button" id="btn-v-set-cover" class="btn ghost">当前帧设为封面</button>
+            <span id="trim-keep-label" class="trim-keep-label muted">拖动两端裁切时长</span>
+          </div>
+          <p id="cover-status" class="cover-status muted hidden"></p>
+          <div class="trim-timeline" id="trim-timeline" aria-label="视频裁切时间轴">
+            <div class="trim-track" id="trim-track">
+              <div class="trim-film" id="trim-film" aria-hidden="true"></div>
+              <div class="trim-shade trim-shade-l" id="trim-shade-l"></div>
+              <div class="trim-shade trim-shade-r" id="trim-shade-r"></div>
+              <div class="trim-range" id="trim-range">
+                <button type="button" class="trim-handle trim-handle-l" id="trim-handle-in" aria-label="入点"></button>
+                <button type="button" class="trim-handle trim-handle-r" id="trim-handle-out" aria-label="出点"></button>
+              </div>
+              <div class="trim-playhead" id="trim-playhead" aria-hidden="true"></div>
+            </div>
+            <div class="trim-meta">
+              <span id="trim-label-in">0:00</span>
+              <span id="trim-label-span">保留 0:00</span>
+              <span id="trim-label-out">0:00</span>
+            </div>
+          </div>
+          <input type="hidden" id="d-trim-start" value="0" />
+          <input type="hidden" id="d-trim-end" value="" />
+        </div>
+        <p id="viewer-hint" class="muted">滚轮缩放，按住拖动平移；开启裁剪后拖动绿色框。点右侧「保存」会一并写入信息与画面修改。</p>
+      </div>
+      <div class="detail-form">
+        <label>时间 <input type="datetime-local" id="d-datetime" /></label>
+        <label>简述 <input type="text" id="d-title" maxlength="30" /></label>
+        <label>描述 <textarea id="d-description" rows="5"></textarea></label>
+        <label>地点 <input type="text" id="d-location" placeholder="例：杭州市西湖区" /></label>
+        <p id="d-location-hint" class="muted loc-hint">写到区县名可定位更准；只写省/市会落在省会或市中心。</p>
+        <div id="narration-block" class="narration-block">
+          <div class="settings-label">旁白音频</div>
+          <p class="muted narration-desc">录制后，看图自动播放可按旁白时长切换下一张（可在播放设置中开关）。</p>
+          <audio id="d-narration-audio" class="narration-audio hidden" controls preload="metadata"></audio>
+          <div id="narration-meter" class="narration-meter hidden" aria-hidden="true">
+            <canvas id="narration-spectrum" width="320" height="56"></canvas>
+            <span id="narration-level" class="narration-level">录音中</span>
+          </div>
+          <div class="actions narration-actions">
+            <button type="button" id="btn-narration-rec" class="btn ghost">开始录音</button>
+            <button type="button" id="btn-narration-stop" class="btn ghost hidden">停止并保存</button>
+            <button type="button" id="btn-narration-del" class="btn ghost hidden">删除旁白</button>
+          </div>
+          <p id="narration-status" class="muted"></p>
+        </div>
+        <button type="button" id="btn-save" class="btn primary">保存</button>
+        <p id="detail-msg" class="muted"></p>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="save-mode-dialog" class="dialog slim">
+    <h3>画面 / 视频已修改，如何写回？</h3>
+    <p class="hint">检测到旋转、裁剪或视频剪辑。默认「另存并替换」更安全；视频处理可能需要一些时间。</p>
+    <label class="radio">
+      <input type="radio" name="save-mode" value="save_as" checked />
+      另存并替换入库
+    </label>
+    <label class="check">
+      <input type="checkbox" id="delete-old" checked />
+      另存成功后删除旧文件
+    </label>
+    <label class="radio">
+      <input type="radio" name="save-mode" value="overwrite" />
+      覆盖原图
+    </label>
+    <p id="save-overwrite-warn" class="hint hidden" style="color:#b45309">将直接改写原图像素，请确认已备份需要的原件。</p>
+    <p id="save-mode-status" class="muted"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn ghost" id="btn-save-cancel">取消</button>
+      <button type="button" class="btn primary" id="btn-save-confirm">确认写回</button>
+    </div>
+  </dialog>
+
+  <dialog id="batch-dialog" class="dialog slim batch-dialog">
+    <h3 id="batch-title">批量编辑</h3>
+    <p class="hint" id="batch-hint">勾选要统一修改的字段；未勾选的字段保持各图原值。</p>
+    <label class="batch-row">
+      <input type="checkbox" id="b-apply-datetime" />
+      <span>时间</span>
+      <input type="datetime-local" id="b-datetime" />
+    </label>
+    <label class="batch-row">
+      <input type="checkbox" id="b-apply-title" />
+      <span>简述</span>
+      <input type="text" id="b-title" maxlength="30" placeholder="如：杭州游玩" />
+    </label>
+    <label class="batch-row">
+      <input type="checkbox" id="b-apply-description" />
+      <span>描述</span>
+      <input type="text" id="b-description" placeholder="可选" />
+    </label>
+    <label class="batch-row">
+      <input type="checkbox" id="b-apply-location" />
+      <span>地点</span>
+      <input type="text" id="b-location" placeholder="如：杭州西湖" />
+    </label>
+    <div class="dialog-actions">
+      <button type="button" class="btn ghost" id="btn-batch-cancel">取消</button>
+      <button type="button" class="btn primary" id="btn-batch-apply">应用到选中</button>
+    </div>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

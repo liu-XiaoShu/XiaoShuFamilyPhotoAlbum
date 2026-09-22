@@ -1,0 +1,17 @@
+version: "3.3"
+
+services:
+  album:
+    build: .
+    image: xiaoshu-album:latest
+    container_name: xiaoshu-album
+    restart: unless-stopped
+    # host 网络：访客 IP/ARP-MAC 更准确，HTTPS 直接监听 8765
+    network_mode: host
+    volumes:
+      - ./album:/app/album
+      - ./inbox:/app/inbox
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      - TZ=Asia/Shanghai

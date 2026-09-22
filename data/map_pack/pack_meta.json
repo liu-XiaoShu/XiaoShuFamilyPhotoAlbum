@@ -1,0 +1,13 @@
+{
+  "version": 1790049435,
+  "style": "standard",
+  "format": "mbtiles",
+  "source": "osm-free",
+  "provider": "OpenStreetMap",
+  "layers": "standard",
+  "built_at": "2026-09-22 13:51:36",
+  "tile_count": 54181,
+  "max_zoom": 12,
+  "min_zoom": 2,
+  "coverage": "china-z10 + places-z11-12"
+}
