@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>超级用户登录 · 小树时光相册</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="/api/brand/icon" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("xiaoshu_theme") || "fresh";
+        if (t !== "fresh" && t !== "cyber") t = "fresh";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body class="login-page">
+  <div class="grid-bg" aria-hidden="true"></div>
+  <main class="login-shell">
+    <div class="login-brand" id="brand-block">
+      <img id="login-brand-icon" class="brand-mark brand-mark-lg" src="/api/brand/icon" alt="" width="72" height="72" />
+      <div>
+        <h1 id="login-brand-title">小树时光相册</h1>
+        <p class="tagline">超级用户登录</p>
+      </div>
+    </div>
+
+    <section class="login-card" id="login-card">
+      <h2 id="login-heading">登录</h2>
+      <p class="hint" id="login-hint">登录后可管理设置、分享与回收站。</p>
+
+      <form id="login-form" class="auth-form" autocomplete="on">
+        <label class="field">
+          <span class="field-label">用户名</span>
+          <input type="text" id="login-user" name="username" value="admin" maxlength="32" autocomplete="username" required />
+        </label>
+        <label class="field">
+          <span class="field-label">密码</span>
+          <div class="pw-wrap">
+            <input type="password" id="login-pass" name="password" maxlength="64" autocomplete="current-password" required placeholder="请输入密码" />
+            <button type="button" class="btn ghost pw-toggle" data-for="login-pass" aria-label="显示密码">显示</button>
+          </div>
+        </label>
+        <div id="setup-extra" class="hidden">
+          <label class="field">
+            <span class="field-label">确认密码</span>
+            <div class="pw-wrap">
+              <input type="password" id="login-pass2" maxlength="64" autocomplete="new-password" placeholder="再次输入密码" />
+              <button type="button" class="btn ghost pw-toggle" data-for="login-pass2" aria-label="显示密码">显示</button>
+            </div>
+          </label>
+          <div class="pw-meter" aria-hidden="true"><i id="login-meter"></i></div>
+          <ul class="pw-rules" id="login-rules">
+            <li data-rule="len">至少 8 位</li>
+            <li data-rule="classes">字母与数字（或符号）至少两类</li>
+            <li data-rule="space">首尾无空格</li>
+            <li data-rule="match">两次输入一致</li>
+          </ul>
+        </div>
+        <button type="submit" class="btn primary login-submit" id="login-submit">登录</button>
+        <p id="login-msg" class="muted" role="status"></p>
+      </form>
+
+      <p class="login-foot muted">
+        忘记密码？在服务器上执行<br />
+        <code>python run.py --reset-admin-password</code>
+      </p>
+    </section>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>
