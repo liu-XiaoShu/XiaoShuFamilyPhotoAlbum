@@ -124,6 +124,9 @@ def save_uploads(items: list[tuple[str, bytes]]) -> dict:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest, _ = unique_path(dest)
         dest.write_bytes(data)
+        from .ops import ensure_host_perms
+        ensure_host_perms(dest.parent, is_dir=True)
+        ensure_host_perms(dest)
         saved.append(str(dest.relative_to(root)).replace("\\", "/"))
     return {"ok": True, "saved": saved, "skipped": skipped, "count": len(saved)}
 
@@ -197,16 +200,31 @@ def ingest_one(
         meta.location = location or None
 
     # Write meta first on a working copy in temp area under album, then move
-    content_hash = file_md5(src)
+    from .ops import content_hash_of, ensure_host_perms, find_existing_by_hash
+
+    content_hash = content_hash_of(src)
+    short_hash = content_hash[:8]
+    if from_import:
+        existed = find_existing_by_hash(content_hash)
+        if existed:
+            return {
+                "ok": True,
+                "skipped": True,
+                "duplicate": True,
+                "path": existed[0],
+                "duplicates": existed,
+                "message": f"已存在相同内容，跳过入库 → {existed[0]}",
+            }
     rel = build_rel_path(
         dt,
         title_final,
         src.suffix,
         config.title_max_len,
-        content_hash=content_hash,
+        content_hash=short_hash,
     )
     dest_dir = config.album_root / rel.parent
     dest_dir.mkdir(parents=True, exist_ok=True)
+    ensure_host_perms(dest_dir, is_dir=True)
     dest, renamed = unique_path(config.album_root / rel, ignore=src)
 
     # If source is already the dest, just update meta
@@ -274,6 +292,10 @@ def ingest_one(
                 orphan.unlink(missing_ok=True)
         raise
 
+    ensure_host_perms(dest)
+    live_check = dest.with_name(dest.name + ".live.mov")
+    if live_check.exists():
+        ensure_host_perms(live_check)
     new_rel = str(dest.relative_to(config.album_root)).replace("\\", "/")
     old_rel = None
     if not from_import:
@@ -285,6 +307,11 @@ def ingest_one(
         _index_move(old_rel, new_rel)
     else:
         _index_upsert(new_rel, uploaded_by_share_id=uploaded_by_share_id)
+    try:
+        from . import media_index
+        media_index.set_content_hash(new_rel, content_hash)
+    except Exception:
+        pass
 
     return {
         "ok": True,
@@ -929,6 +956,8 @@ def get_photo(album_rel: str) -> dict:
         "size": path.stat().st_size,
         "kind": kind,
         "meta": meta.to_dict(),
+        "has_live": False,
+        "live_video_path": None,
     }
     if kind == "video":
         from .video import cover_path, probe_duration, read_sidecar
@@ -953,6 +982,11 @@ def get_photo(album_rel: str) -> dict:
             out["has_audio"] = False
             out["audio_path"] = None
             out["audio_duration"] = None
+        from .ops import live_video_for
+        live = live_video_for(path)
+        if live is not None:
+            out["has_live"] = True
+            out["live_video_path"] = str(live.relative_to(config.album_root)).replace("\\", "/")
     return out
 
 

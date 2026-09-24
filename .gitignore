@@ -1,0 +1,47 @@
+.vendor/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+.DS_Store
+*.AppImage
+
+# 本机配置（含绝对路径 / 个性化标题）
+config.json
+
+# 用户媒资（勿入库）
+album/**
+!album/.gitkeep
+inbox/**
+!inbox/.gitkeep
+album/.trash/
+
+# 运行时数据
+data/thumbs/**
+!data/thumbs/.gitkeep
+data/auth.sqlite
+data/auth.sqlite-*
+data/visitors.sqlite
+data/visitors.sqlite-*
+data/certs/
+data/brand/**
+!data/brand/.gitkeep
+data/map_tiles/
+data/map_pack/*.mbtiles
+data/map_pack/*.mbtiles-*
+data/map_pack/*.part
+data/map_pack/pack_meta.json
+data/map_pack/tile_counts.json
+data/map_pack/xyz/
+data/map_pack/xyz_amap/
+
+_staging/
+**/_staging/
+
+# 编辑器 / 本地工具
+.cursor/
+Untitled
+Untitled.*
+*.AppImage

@@ -80,8 +80,13 @@ def init_media_tables() -> None:
         cols = {str(r[1]) for r in con.execute("PRAGMA table_info(media)").fetchall()}
         if "uploaded_by_share_id" not in cols:
             con.execute("ALTER TABLE media ADD COLUMN uploaded_by_share_id INTEGER")
+        if "content_hash" not in cols:
+            con.execute("ALTER TABLE media ADD COLUMN content_hash TEXT")
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_media_uploader ON media(uploaded_by_share_id)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_hash ON media(content_hash)"
         )
 
 
@@ -173,6 +178,7 @@ def _row_from_file(path: Path, rel: str) -> dict[str, Any] | None:
         "mtime": st.st_mtime,
         "size": st.st_size,
         "updated_at": _iso(),
+        "content_hash": None,
     }
 
 
@@ -247,8 +253,8 @@ def upsert_media(
                 INSERT INTO media(
                   path, name, kind, year, month, datetime, title, description,
                   location, lat, lng, has_audio, mtime, size, updated_at,
-                  uploaded_by_share_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  uploaded_by_share_id, content_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                   name=excluded.name, kind=excluded.kind, year=excluded.year,
                   month=excluded.month, datetime=excluded.datetime, title=excluded.title,
@@ -257,6 +263,9 @@ def upsert_media(
                   mtime=excluded.mtime, size=excluded.size, updated_at=excluded.updated_at,
                   uploaded_by_share_id=COALESCE(
                     excluded.uploaded_by_share_id, media.uploaded_by_share_id
+                  ),
+                  content_hash=COALESCE(
+                    excluded.content_hash, media.content_hash
                   )
                 """,
                 (
@@ -276,6 +285,7 @@ def upsert_media(
                     row["size"],
                     row["updated_at"],
                     sid,
+                    row.get("content_hash"),
                 ),
             )
             invalidate = True
@@ -366,8 +376,8 @@ def rebuild_index(*, force: bool = False) -> dict:
                 INSERT INTO media(
                   path, name, kind, year, month, datetime, title, description,
                   location, lat, lng, has_audio, mtime, size, updated_at,
-                  uploaded_by_share_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  uploaded_by_share_id, content_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -387,6 +397,7 @@ def rebuild_index(*, force: bool = False) -> dict:
                         r["size"],
                         r["updated_at"],
                         r.get("uploaded_by_share_id"),
+                        r.get("content_hash"),
                     )
                     for r in rows
                 ],
@@ -1030,3 +1041,128 @@ def start_rebuild_async() -> dict:
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "message": "已开始重建索引", **status()}
+
+
+def set_content_hash(album_rel: str, content_hash: str) -> None:
+    rel = str(album_rel).replace("\\", "/").lstrip("/")
+    h = (content_hash or "").strip().lower()
+    if not rel or not h:
+        return
+    init_media_tables()
+    with connect() as con:
+        con.execute(
+            "UPDATE media SET content_hash = ?, updated_at = ? WHERE path = ?",
+            (h, _iso(), rel),
+        )
+
+
+def paths_by_content_hash(content_hash: str) -> list[str]:
+    h = (content_hash or "").strip().lower()
+    if not h:
+        return []
+    init_media_tables()
+    with connect() as con:
+        rows = con.execute(
+            "SELECT path FROM media WHERE content_hash = ? ORDER BY path",
+            (h,),
+        ).fetchall()
+    return [r["path"] for r in rows]
+
+
+def duplicate_groups(*, limit: int = 200) -> dict:
+    init_media_tables()
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT content_hash, COUNT(*) AS c
+            FROM media
+            WHERE content_hash IS NOT NULL AND TRIM(content_hash) != ''
+            GROUP BY content_hash
+            HAVING c > 1
+            ORDER BY c DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 200), 500)),),
+        ).fetchall()
+        groups = []
+        for r in rows:
+            items = con.execute(
+                """
+                SELECT path, name, kind, size, datetime, title
+                FROM media WHERE content_hash = ? ORDER BY datetime, path
+                """,
+                (r["content_hash"],),
+            ).fetchall()
+            groups.append(
+                {
+                    "content_hash": r["content_hash"],
+                    "count": int(r["c"]),
+                    "items": [
+                        {
+                            "path": it["path"],
+                            "name": it["name"],
+                            "kind": it["kind"],
+                            "size": it["size"],
+                            "datetime": it["datetime"],
+                            "title": it["title"],
+                        }
+                        for it in items
+                    ],
+                }
+            )
+    return {"groups": groups, "count": len(groups)}
+
+
+def search_media(
+    q: str,
+    *,
+    limit: int = 60,
+    offset: int = 0,
+    scopes: list[str] | None = None,
+    media_paths: list[str] | None = None,
+    uploaded_by_share_id: int | None = None,
+) -> dict:
+    init_media_tables()
+    text = (q or "").strip()
+    if not text:
+        return {"items": [], "total": 0, "q": q, "limit": limit, "offset": offset}
+    limit = max(1, min(int(limit or 60), 200))
+    offset = max(0, int(offset or 0))
+    like = f"%{text}%"
+    where_scope, args_scope = _scope_clause(scopes, media_paths, uploaded_by_share_id)
+    sql_where = (
+        " WHERE ("
+        " IFNULL(title,'') LIKE ? OR IFNULL(description,'') LIKE ?"
+        " OR IFNULL(location,'') LIKE ? OR IFNULL(name,'') LIKE ?"
+        " OR IFNULL(path,'') LIKE ? OR IFNULL(datetime,'') LIKE ?"
+        " )"
+        + where_scope
+    )
+    args = [like, like, like, like, like, like] + args_scope
+    with connect() as con:
+        total = con.execute(
+            f"SELECT COUNT(*) AS c FROM media{sql_where}", args
+        ).fetchone()["c"]
+        rows = con.execute(
+            f"""
+            SELECT path, name, kind, year, month, datetime, title, description,
+                   location, lat, lng, has_audio, size
+            FROM media
+            {sql_where}
+            ORDER BY datetime DESC, path DESC
+            LIMIT ? OFFSET ?
+            """,
+            args + [limit, offset],
+        ).fetchall()
+    items = []
+    for r in rows:
+        d = _photo_dict(r)
+        d["size"] = r["size"]
+        items.append(d)
+    return {
+        "items": items,
+        "total": int(total),
+        "q": text,
+        "limit": limit,
+        "offset": offset,
+    }

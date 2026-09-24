@@ -23,7 +23,7 @@ const state = {
   section: "browse",
   manageTab: (() => {
     const m = localStorage.getItem("xiaoshu_manage") || "album";
-    return ["album", "import", "trash", "settings", "visitors", "about"].includes(m) ? m : "album";
+    return ["album", "import", "trash", "settings", "storage", "visitors", "about"].includes(m) ? m : "album";
   })(),
   trashSort: localStorage.getItem("xiaoshu_trash_sort") || "deleted_at",
   trashSelectMode: false,
@@ -138,6 +138,7 @@ function applyManageTab() {
   $("#manage-import")?.classList.toggle("hidden", tab !== "import");
   $("#manage-trash")?.classList.toggle("hidden", tab !== "trash");
   $("#manage-settings")?.classList.toggle("hidden", tab !== "settings");
+  $("#manage-storage")?.classList.toggle("hidden", tab !== "storage");
   $("#manage-visitors")?.classList.toggle("hidden", tab !== "visitors");
   $("#manage-about")?.classList.toggle("hidden", tab !== "about");
   if (tab !== "album" && state.selectMode) setSelectMode(false);
@@ -146,6 +147,7 @@ function applyManageTab() {
   if (tab === "import") loadImport().catch(console.error);
   if (tab === "trash") loadTrash().catch(console.error);
   if (tab === "settings") loadSettings().catch(console.error);
+  if (tab === "storage") loadStorage().catch(console.error);
   if (tab === "visitors") loadVisitorStats().catch(console.error);
 }
 
@@ -155,6 +157,7 @@ function manageTabsAllowed() {
   if (me.can_upload || me.open_mode) tabs.push("import");
   if (me.can_trash || me.open_mode) tabs.push("trash");
   if (me.can_settings || me.open_mode || me.needs_setup) tabs.push("settings");
+  if (me.can_settings) tabs.push("storage");
   if (me.can_settings) tabs.push("visitors");
   // 登录后均可看关于（含分享访客）
   if (me.authenticated || me.open_mode) tabs.push("about");
@@ -509,9 +512,11 @@ function buildMonthSelectBar(monthKey) {
   bar.className = "album-select-bar";
   bar.innerHTML = `
     <button type="button" class="btn ghost btn-scope-select">选择</button>
+    <button type="button" class="btn ghost btn-scope-all hidden">全选</button>
     <button type="button" class="btn ghost btn-scope-batch hidden">批量编辑</button>
     <button type="button" class="btn ghost btn-scope-trash hidden">移入回收站</button>`;
   const btnSelect = bar.querySelector(".btn-scope-select");
+  const btnAll = bar.querySelector(".btn-scope-all");
   const btnBatch = bar.querySelector(".btn-scope-batch");
   const btnTrash = bar.querySelector(".btn-scope-trash");
   btnSelect.addEventListener("click", async (e) => {
@@ -530,6 +535,23 @@ function buildMonthSelectBar(monthKey) {
     } finally {
       btnSelect.disabled = false;
     }
+  });
+  btnAll.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!(state.selectMode && state.selectScope === monthKey && state.selectPathsSet)) return;
+    const allPaths = [...state.selectPathsSet];
+    const allOn = allPaths.length > 0 && allPaths.every((p) => state.selectedPaths.has(p));
+    if (allOn) {
+      state.selectedPaths.clear();
+      document.querySelectorAll(".photo-card.selectable").forEach((c) => c.classList.remove("selected"));
+    } else {
+      allPaths.forEach((p) => state.selectedPaths.add(p));
+      document.querySelectorAll(".photo-card.selectable").forEach((c) => {
+        if (state.selectedPaths.has(c.dataset.path)) c.classList.add("selected");
+      });
+    }
+    updateSelectUI();
   });
   btnBatch.addEventListener("click", (e) => {
     e.preventDefault();
@@ -561,6 +583,14 @@ function syncScopeBars() {
     bar.querySelector(".btn-scope-select").textContent = active ? "取消选择" : "选择";
     bar.querySelector(".btn-scope-select").classList.toggle("is-active", active);
     const n = active ? state.selectedPaths.size : 0;
+    const scopeSize = active && state.selectPathsSet ? state.selectPathsSet.size : 0;
+    const allOn = active && scopeSize > 0 && n >= scopeSize;
+    const allBtn = bar.querySelector(".btn-scope-all");
+    if (allBtn) {
+      allBtn.classList.toggle("hidden", !active);
+      allBtn.textContent = allOn ? "取消全选" : "全选";
+      allBtn.classList.toggle("is-active", allOn);
+    }
     const batch = bar.querySelector(".btn-scope-batch");
     const trash = bar.querySelector(".btn-scope-trash");
     batch.classList.toggle("hidden", !(active && n > 0));
@@ -786,6 +816,7 @@ async function openYearMonthInTree(year, month) {
   $("#manage-import")?.classList.add("hidden");
   $("#manage-trash")?.classList.add("hidden");
   $("#manage-settings")?.classList.add("hidden");
+  $("#manage-storage")?.classList.add("hidden");
   $("#manage-visitors")?.classList.add("hidden");
   $("#manage-about")?.classList.add("hidden");
   await loadTree();
@@ -1360,11 +1391,17 @@ function renderImportItems(items) {
     const meta = it.meta || {};
     const kind = it.kind || (isVideoName(it.name) ? "video" : "image");
     const heic = isHeicName(it.name || it.path);
+    const mobile = isMobileClient();
     let preview;
     if (kind === "video") {
       preview = it.live_companion
         ? `<div class="import-video-ph" title="实况伴生视频">Live</div>`
         : `<div class="import-video-ph" title="视频">▶</div>`;
+    } else if (mobile) {
+      // 手机列表先不生成 HEIC/大图预览（树莓派解码很慢），入库不受影响
+      preview = heic
+        ? `<div class="import-video-ph" title="HEIC 原件">HEIC</div>`
+        : `<div class="import-video-ph" title="图片">图</div>`;
     } else if (heic) {
       preview = `<img loading="lazy" decoding="async" src="/api/preview?source=import&path=${encodeURIComponent(it.path)}&size=240" alt="" />`;
     } else {
@@ -1394,8 +1431,17 @@ function renderImportItems(items) {
 }
 
 async function loadImport() {
+  const empty = $("#import-empty");
+  const list = $("#import-list");
+  if (list && !list.children.length) {
+    if (empty) {
+      empty.classList.remove("hidden");
+      empty.textContent = "正在读取并解析元数据…";
+    }
+  }
   const data = await api("/api/import/list");
-  renderImportItems(data.items);
+  if (empty) empty.textContent = "暂无待入库媒体，先拖入或选择文件。";
+  renderImportItems(data.items || []);
 }
 
 $("#btn-reload-import").addEventListener("click", () => loadImport().catch(alert));
@@ -1607,7 +1653,7 @@ function setupImportMobileUX() {
     }
     if (hint) {
       hint.textContent =
-        "手机/平板：用「从相册选择」导入。支持苹果 HEIC、实况、MOV；按字节拷贝，不转码不压画质。解析只预填，点「入库」才写入相册。";
+        "手机/平板：用「从相册选择」导入。支持苹果 HEIC、实况、MOV；按字节拷贝，不转码不压画质。上传后自动解析元数据，可编辑后点「入库」。";
     }
   }
 }
@@ -1657,37 +1703,161 @@ async function fromDataTransfer(dt) {
     .map((file) => ({ file, path: file.webkitRelativePath || file.name }));
 }
 
+const uploadQueue = {
+  items: [], // {id, file, path, status, error, saved}
+  paused: false,
+  running: false,
+  seq: 0,
+};
+
+function formatBytes(n) {
+  const x = Number(n) || 0;
+  if (x < 1024) return `${x} B`;
+  if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`;
+  if (x < 1024 * 1024 * 1024) return `${(x / 1024 / 1024).toFixed(1)} MB`;
+  return `${(x / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function renderUploadQueue() {
+  const box = $("#upload-queue");
+  const list = $("#upload-queue-list");
+  const sum = $("#upload-queue-summary");
+  if (!box || !list) return;
+  const items = uploadQueue.items;
+  box.classList.toggle("hidden", !items.length);
+  const pending = items.filter((x) => x.status === "pending" || x.status === "uploading").length;
+  const done = items.filter((x) => x.status === "done").length;
+  const failed = items.filter((x) => x.status === "error").length;
+  if (sum) {
+    sum.textContent = `${items.length} 项 · 完成 ${done} · 失败 ${failed} · 等待 ${pending}${
+      uploadQueue.paused ? " · 已暂停" : ""
+    }`;
+  }
+  list.innerHTML = items
+    .map((it) => {
+      const st =
+        it.status === "uploading"
+          ? "上传中"
+          : it.status === "done"
+            ? "完成"
+            : it.status === "error"
+              ? "失败"
+              : it.status === "paused"
+                ? "暂停"
+                : "等待";
+      return `<li class="uq-item uq-${it.status}" data-id="${it.id}">
+        <span class="uq-name" title="${escapeAttr(it.path || it.file?.name || "")}">${escapeHtml(it.file?.name || it.path || "")}</span>
+        <span class="uq-meta muted">${formatBytes(it.file?.size)} · ${st}${it.error ? " · " + escapeHtml(it.error) : ""}</span>
+      </li>`;
+    })
+    .join("");
+  const pauseBtn = $("#btn-queue-pause");
+  const resumeBtn = $("#btn-queue-resume");
+  pauseBtn?.classList.toggle("hidden", uploadQueue.paused || !pending);
+  resumeBtn?.classList.toggle("hidden", !uploadQueue.paused);
+}
+
+async function pumpUploadQueue() {
+  if (uploadQueue.running) return;
+  uploadQueue.running = true;
+  const mobile = isMobileClient();
+  try {
+    while (true) {
+      if (uploadQueue.paused) break;
+      const next = uploadQueue.items.find((x) => x.status === "pending");
+      if (!next) break;
+      next.status = "uploading";
+      renderUploadQueue();
+      $("#drop-status").textContent = `正在上传：${next.file?.name || ""}`;
+      try {
+        const form = new FormData();
+        form.append("files", next.file, next.file.name);
+        form.append("paths", next.path || next.file.name);
+        const res = await fetch("/api/import/upload", {
+          method: "POST",
+          body: form,
+          credentials: "same-origin",
+        });
+        if (!res.ok) {
+          let msg = res.statusText;
+          try {
+            const j = await res.json();
+            msg = j.detail || msg;
+          } catch (_) {}
+          throw new Error(typeof msg === "string" ? msg : "上传失败");
+        }
+        const data = await res.json();
+        next.status = "done";
+        next.saved = data.count || 0;
+        if ((data.skipped || []).length) {
+          next.error = "服务端跳过";
+        }
+      } catch (err) {
+        next.status = "error";
+        next.error = err.message || String(err);
+      }
+      renderUploadQueue();
+      if (!mobile) {
+        // 电脑可小批量并行感：仍逐个，避免占满内存
+      }
+    }
+  } finally {
+    uploadQueue.running = false;
+  }
+  const saved = uploadQueue.items.filter((x) => x.status === "done").reduce((n, x) => n + (x.saved || 1), 0);
+  const failed = uploadQueue.items.filter((x) => x.status === "error").length;
+  $("#drop-status").textContent = uploadQueue.paused
+    ? "上传已暂停"
+    : `队列完成：成功 ${saved}，失败 ${failed}`;
+  if (saved) await loadImport().catch(console.error);
+}
+
 async function uploadPairs(pairs) {
   if (!pairs.length) {
     $("#drop-status").textContent = "没有可导入的图片或视频";
     return;
   }
-  $("#drop-status").textContent = `正在导入 ${pairs.length} 个文件…`;
-  const batchSize = isMobileClient() ? 4 : 12;
-  let saved = 0;
-  let skipped = 0;
-  for (let i = 0; i < pairs.length; i += batchSize) {
-    const slice = pairs.slice(i, i + batchSize);
-    const form = new FormData();
-    slice.forEach(({ file, path }) => {
-      form.append("files", file, file.name);
-      form.append("paths", path || file.name);
+  pairs.forEach(({ file, path }) => {
+    uploadQueue.items.push({
+      id: `uq-${++uploadQueue.seq}`,
+      file,
+      path: path || file.name,
+      status: "pending",
+      error: "",
+      saved: 0,
     });
-    const res = await fetch("/api/import/upload", { method: "POST", body: form });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try {
-        const j = await res.json();
-        msg = j.detail || msg;
-      } catch (_) {}
-      throw new Error(typeof msg === "string" ? msg : "上传失败");
-    }
-    const data = await res.json();
-    saved += data.count || 0;
-    skipped += (data.skipped || []).length;
-  }
-  $("#drop-status").textContent = `已放入待入库区 ${saved} 项${skipped ? `，跳过 ${skipped} 个` : ""}`;
-  await loadImport();
+  });
+  uploadQueue.paused = false;
+  renderUploadQueue();
+  await pumpUploadQueue();
+}
+
+function wireUploadQueueControls() {
+  $("#btn-queue-pause")?.addEventListener("click", () => {
+    uploadQueue.paused = true;
+    renderUploadQueue();
+    $("#drop-status").textContent = "上传已暂停";
+  });
+  $("#btn-queue-resume")?.addEventListener("click", () => {
+    uploadQueue.paused = false;
+    renderUploadQueue();
+    pumpUploadQueue().catch(console.error);
+  });
+  $("#btn-queue-retry")?.addEventListener("click", () => {
+    uploadQueue.items.forEach((x) => {
+      if (x.status === "error") {
+        x.status = "pending";
+        x.error = "";
+      }
+    });
+    uploadQueue.paused = false;
+    renderUploadQueue();
+    pumpUploadQueue().catch(console.error);
+  });
+  $("#btn-queue-clear")?.addEventListener("click", () => {
+    uploadQueue.items = uploadQueue.items.filter((x) => x.status !== "done");
+    renderUploadQueue();
+  });
 }
 
 const zone = $("#drop-zone");
@@ -2229,6 +2399,9 @@ const lbFx = $("#lb-fx");
 const lbStage = $("#lb-stage");
 const lbImg = $("#lb-img");
 const lbVideo = $("#lb-video");
+const lbLiveVideo = $("#lb-live-video");
+let lbLivePath = null;
+let lbLivePlaying = false;
 
 const lb = {
   zoom: 1,
@@ -2567,6 +2740,7 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   state.currentPath = path;
   lbUpdateChrome();
   lbResetView();
+  lbStopLive();
   lbStopNarration();
   lb.hasAudio = false;
   lb.audioUrl = null;
@@ -2601,6 +2775,8 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
     $("#lb-title").textContent =
       (data.meta && data.meta.title) || data.name || path.split("/").pop();
     const fileUrl = `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+    const previewUrl = `/api/preview?path=${encodeURIComponent(path)}&size=2000&t=${Date.now()}`;
+    const mobile = isMobileClient();
     if (kind === "video") {
       lbImg.removeAttribute("src");
       lbVideo.pause();
@@ -2610,20 +2786,31 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
       lbVideo.pause();
       lbVideo.removeAttribute("src");
       lbVideo.load();
-      const waitImg = new Promise((resolve) => {
-        const done = () => {
-          lbImg.removeEventListener("load", done);
-          lbImg.removeEventListener("error", done);
-          resolve();
-        };
-        lbImg.addEventListener("load", done, { once: true });
-        lbImg.addEventListener("error", done, { once: true });
-      });
-      lbImg.src = isHeicName(data.name || path)
-        ? `/api/preview?path=${encodeURIComponent(path)}&size=2000&t=${Date.now()}`
-        : fileUrl;
-      await waitImg;
+      const loadOnce = (url) =>
+        new Promise((resolve) => {
+          const done = (ok) => {
+            lbImg.removeEventListener("load", onLoad);
+            lbImg.removeEventListener("error", onErr);
+            resolve(ok);
+          };
+          const onLoad = () => done(true);
+          const onErr = () => done(false);
+          lbImg.addEventListener("load", onLoad, { once: true });
+          lbImg.addEventListener("error", onErr, { once: true });
+          lbImg.src = url;
+        });
+      // 手机端优先用预览图：省流量、避 HEIC/超大原图在 Safari 黑屏
+      const preferPreview = mobile || isHeicName(data.name || path);
+      let ok = await loadOnce(preferPreview ? previewUrl : fileUrl);
+      if (!ok) {
+        ok = await loadOnce(preferPreview ? fileUrl : previewUrl);
+      }
+      if (!ok) {
+        $("#lb-title").textContent = "图片加载失败";
+      }
+      lbSetupLive(data);
     }
+
     if (opts.withFx) await lbRunFxIn(dir);
     else lbClearFx();
     if (lb.playing) {
@@ -2639,6 +2826,29 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   }
 
   if (lb.playing) lbScheduleNext();
+}
+
+
+function downloadAlbumPath(path, source = "album") {
+  if (!path) {
+    alert("没有可下载的文件");
+    return;
+  }
+  const url =
+    `/api/download?path=${encodeURIComponent(path)}&source=${encodeURIComponent(source)}&t=${Date.now()}`;
+  // 用隐藏 a[download] + credentials：同域 cookie 会话可带上
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noopener";
+  // 不设 download 属性名：由服务端 Content-Disposition 决定文件名（含中文）
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function lbDownloadCurrent() {
+  const path = (state.galleryPaths || [])[state.galleryIndex] || state.currentPath;
+  downloadAlbumPath(path, "album");
 }
 
 function openLightbox(path, paths = null, hintMeta = null) {
@@ -2709,6 +2919,10 @@ $("#lb-next")?.addEventListener("click", () => {
   lbGo(1, { withFx: true });
 });
 $("#lb-edit")?.addEventListener("click", () => lbOpenEdit());
+$("#lb-download")?.addEventListener("click", () => lbDownloadCurrent());
+$("#btn-detail-download")?.addEventListener("click", () => {
+  downloadAlbumPath(state.currentPath, "album");
+});
 $("#lb-play")?.addEventListener("click", () => lbToggleAutoplay());
 $("#lb-play-settings")?.addEventListener("click", (e) => {
   e.stopPropagation();
@@ -4449,12 +4663,7 @@ $("#settings-form")?.addEventListener("submit", (e) => {
   e.preventDefault();
 });
 
-function formatBytes(n) {
-  const x = Number(n) || 0;
-  if (x < 1024) return `${x} B`;
-  if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`;
-  return `${(x / 1024 / 1024).toFixed(1)} MB`;
-}
+
 
 async function refreshMapPackStatus() {
   const el = $("#map-pack-status");
@@ -4605,18 +4814,27 @@ function formatTrashTime(iso) {
 function updateTrashSelectUI() {
   const on = state.trashSelectMode;
   const n = state.trashSelected.size;
+  const total = (state.trashItems || []).length;
+  const allOn = on && total > 0 && n >= total;
   const btnSelect = $("#btn-trash-select");
+  const btnAll = $("#btn-trash-select-all");
   const btnRestore = $("#btn-trash-restore");
   const btnPurge = $("#btn-trash-purge");
   if (btnSelect) {
     btnSelect.textContent = on ? "取消选择" : "选择";
     btnSelect.classList.toggle("is-active", on);
   }
+  if (btnAll) {
+    btnAll.classList.toggle("hidden", !on);
+    btnAll.textContent = allOn ? "取消全选" : "全选";
+    btnAll.classList.toggle("is-active", allOn);
+  }
   btnRestore?.classList.toggle("hidden", !(on && n > 0));
   btnPurge?.classList.toggle("hidden", !(on && n > 0));
   if (btnRestore) btnRestore.textContent = n ? `恢复(${n})` : "恢复";
   if (btnPurge) btnPurge.textContent = n ? `彻底删除(${n})` : "彻底删除";
   $("#trash-grid")?.classList.toggle("trash-selecting", on);
+  document.body.classList.toggle("trash-select-mode", on);
 }
 
 function setTrashSelectMode(on) {
@@ -4708,6 +4926,21 @@ $("#btn-trash-select")?.addEventListener("click", () => {
   setTrashSelectMode(!state.trashSelectMode);
 });
 
+$("#btn-trash-select-all")?.addEventListener("click", () => {
+  if (!state.trashSelectMode) return;
+  const items = state.trashItems || [];
+  const allOn = items.length > 0 && items.every((it) => state.trashSelected.has(it.id));
+  if (allOn) {
+    state.trashSelected.clear();
+  } else {
+    items.forEach((it) => state.trashSelected.add(it.id));
+  }
+  document.querySelectorAll("#trash-grid .trash-card").forEach((c) => {
+    c.classList.toggle("selected", state.trashSelected.has(c.dataset.id));
+  });
+  updateTrashSelectUI();
+});
+
 $("#btn-trash-refresh")?.addEventListener("click", () => {
   loadTrash().catch((e) => alert(e.message));
 });
@@ -4752,6 +4985,300 @@ $("#btn-trash-purge")?.addEventListener("click", async () => {
   } catch (e) {
     alert(e.message);
   }
+});
+
+
+/* —— 搜索 —— */
+async function runSearch(q) {
+  const root = $("#search-root");
+  if (!root) return;
+  const text = (q || "").trim();
+  if (!text) {
+    clearSearch();
+    return;
+  }
+  root.classList.remove("hidden");
+  root.innerHTML = `<p class="muted">搜索中…</p>`;
+  $("#btn-search-clear")?.classList.remove("hidden");
+  // 隐藏常规浏览根
+  $("#journey-root")?.classList.add("hidden");
+  $("#classic-root")?.classList.add("hidden");
+  $("#map-root")?.classList.add("hidden");
+  $("#browse-empty")?.classList.add("hidden");
+  const data = await api(`/api/search?q=${encodeURIComponent(text)}&limit=80`);
+  const items = data.items || [];
+  if (!items.length) {
+    root.innerHTML = `<p class="empty">没有匹配「${escapeHtml(text)}」的结果</p>`;
+    return;
+  }
+  const paths = items.map((x) => x.path);
+  root.innerHTML = `<div class="search-head"><strong>找到 ${data.total} 项</strong><span class="muted">显示 ${items.length} 项</span></div>
+    <div class="photo-grid search-grid" id="search-grid"></div>`;
+  const grid = $("#search-grid");
+  items.forEach((p) => {
+    grid.appendChild(makePhotoCard(p, paths));
+  });
+}
+
+function clearSearch() {
+  const root = $("#search-root");
+  root?.classList.add("hidden");
+  if (root) root.innerHTML = "";
+  $("#btn-search-clear")?.classList.add("hidden");
+  $("#search-q").value = "";
+  // 恢复当前浏览模式
+  const view = state.view || "journey";
+  $("#journey-root")?.classList.toggle("hidden", view !== "journey");
+  $("#classic-root")?.classList.toggle("hidden", view !== "classic");
+  $("#map-root")?.classList.toggle("hidden", view !== "map");
+}
+
+function setSearchOpen(open) {
+  const bar = $("#search-bar");
+  const btn = $("#btn-search-toggle");
+  if (!bar) return;
+  bar.classList.toggle("hidden", !open);
+  btn?.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) {
+    setTimeout(() => $("#search-q")?.focus(), 30);
+  }
+}
+
+$("#btn-search-toggle")?.addEventListener("click", () => {
+  const bar = $("#search-bar");
+  const open = bar?.classList.contains("hidden");
+  setSearchOpen(Boolean(open));
+});
+$("#btn-search-close")?.addEventListener("click", () => {
+  setSearchOpen(false);
+});
+$("#search-bar")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  runSearch($("#search-q")?.value || "").catch((err) => alert(err.message || err));
+});
+$("#btn-search-clear")?.addEventListener("click", () => clearSearch());
+
+/* —— 存储看板 —— */
+async function loadStorage() {
+  const cards = $("#storage-cards");
+  const msg = $("#storage-msg");
+  if (!cards) return;
+  cards.innerHTML = `<p class="muted">加载中…</p>`;
+  const data = await api("/api/storage");
+  const b = data.bytes || {};
+  const d = data.disk || {};
+  const c = data.counts || {};
+  const pct = d.percent_used || 0;
+  cards.innerHTML = `
+    <div class="storage-card disk">
+      <div class="storage-label">磁盘水位</div>
+      <div class="storage-value">${pct}%</div>
+      <div class="storage-bar"><i style="width:${Math.min(100, pct)}%"></i></div>
+      <div class="muted">已用 ${formatBytes(d.used)} / ${formatBytes(d.total)} · 剩余 ${formatBytes(d.free)}</div>
+    </div>
+    <div class="storage-card"><div class="storage-label">相册原片</div><div class="storage-value">${formatBytes(b.album)}</div><div class="muted">${c.media || 0} 项媒资</div></div>
+    <div class="storage-card"><div class="storage-label">回收站</div><div class="storage-value">${formatBytes(b.trash)}</div><div class="muted">${c.trash || 0} 项</div></div>
+    <div class="storage-card"><div class="storage-label">待入库</div><div class="storage-value">${formatBytes(b.inbox)}</div></div>
+    <div class="storage-card"><div class="storage-label">缩略图缓存</div><div class="storage-value">${formatBytes(b.thumbs)}</div></div>
+    <div class="storage-card"><div class="storage-label">离线地图包</div><div class="storage-value">${formatBytes(b.map_pack)}</div></div>
+    <div class="storage-card"><div class="storage-label">data 合计</div><div class="storage-value">${formatBytes(b.data)}</div></div>
+  `;
+  if (msg) msg.textContent = "";
+  const dedup = $("#dedup-root");
+  if (dedup && !dedup.dataset.loaded) {
+    dedup.innerHTML = `<p class="muted">点「检查重复项」扫描内容指纹并列出可处理的重复组。</p>`;
+  }
+}
+
+async function checkAndLoadDedup() {
+  const root = $("#dedup-root");
+  const msg = $("#storage-msg");
+  if (!root) return;
+  root.innerHTML = `<p class="muted">正在补算指纹并检查重复…</p>`;
+  if (msg) msg.textContent = "扫描中…";
+  try {
+    const scan = await api("/api/dedup/scan", { method: "POST", body: "{}" });
+    if (msg) msg.textContent = scan.message || "指纹已更新";
+  } catch (e) {
+    if (msg) msg.textContent = e.message || String(e);
+  }
+  await loadDedupList();
+}
+
+async function loadDedupList() {
+  const root = $("#dedup-root");
+  if (!root) return;
+  root.dataset.loaded = "1";
+  root.innerHTML = `<p class="muted">加载重复项…</p>`;
+  const data = await api("/api/dedup?limit=100");
+  const groups = data.groups || [];
+  if (!groups.length) {
+    root.innerHTML = `<p class="empty">未发现内容重复。入库时相同文件会自动跳过；也可点「检查重复项」再扫一次。</p>`;
+    return;
+  }
+  root.innerHTML =
+    `<div class="search-head"><strong>发现 ${groups.length} 组重复</strong><span class="muted">勾选要保留的一份，其余移入回收站</span></div>` +
+    groups
+      .map((g, gi) => {
+        const items = g.items || [];
+        const rows = items
+          .map((it, ii) => {
+            const id = `dedup-${gi}-${ii}`;
+            const checked = ii === 0 ? "checked" : "";
+            return `<label class="dedup-item">
+              <input type="radio" name="dedup-g-${gi}" value="${escapeAttr(it.path)}" ${checked} />
+              <span><code>${escapeHtml(it.path)}</code><br/><span class="muted">${formatBytes(it.size)} · ${escapeHtml(it.datetime || "")} · ${escapeHtml(it.title || "")}</span></span>
+              <button type="button" class="btn ghost btn-dedup-open" data-path="${escapeAttr(it.path)}">查看</button>
+            </label>`;
+          })
+          .join("");
+        return `<details class="dedup-group" open>
+          <summary>${items.length} 份相同 · ${escapeHtml((g.content_hash || "").slice(0, 12))}…</summary>
+          <div class="dedup-list" data-group="${gi}">${rows}</div>
+          <div class="dedup-actions">
+            <button type="button" class="btn primary btn-dedup-resolve-one" data-group="${gi}">其余移入回收站</button>
+          </div>
+        </details>`;
+      })
+      .join("");
+}
+
+async function resolveDedupGroup(groupEl) {
+  const keep = groupEl.querySelector('input[type="radio"]:checked')?.value;
+  if (!keep) {
+    alert("请先选择要保留的一份");
+    return;
+  }
+  const remove = [...groupEl.querySelectorAll('input[type="radio"]')]
+    .map((el) => el.value)
+    .filter((p) => p && p !== keep);
+  if (!remove.length) {
+    alert("该组没有其它重复项");
+    return;
+  }
+  if (!confirm(`保留：\n${keep}\n\n其余 ${remove.length} 项移入回收站？`)) return;
+  const r = await api("/api/dedup/resolve", {
+    method: "POST",
+    body: JSON.stringify({ keep, remove }),
+  });
+  alert(r.message || "已处理");
+  await loadDedupList();
+  await loadStorage().catch(() => {});
+  await loadTree(true).catch(() => {});
+}
+
+$("#dedup-root")?.addEventListener("click", (e) => {
+  const openBtn = e.target.closest?.(".btn-dedup-open");
+  if (openBtn) {
+    const path = openBtn.dataset.path;
+    if (path) openLightbox(path, [path]);
+    return;
+  }
+  const resolveBtn = e.target.closest?.(".btn-dedup-resolve-one");
+  if (resolveBtn) {
+    const details = resolveBtn.closest(".dedup-group");
+    const list = details?.querySelector(".dedup-list");
+    if (list) resolveDedupGroup(list).catch((err) => alert(err.message || err));
+  }
+});
+
+$("#btn-storage-refresh")?.addEventListener("click", () => loadStorage().catch((e) => alert(e.message)));
+$("#btn-dedup-check")?.addEventListener("click", () => checkAndLoadDedup().catch((e) => alert(e.message)));
+async function resolveAllDedup(strategy) {
+  const label = strategy === "newest" ? "每组保留拍摄时间最新的一份" : "每组保留拍摄时间最早的一份";
+  if (!confirm(`${label}，其余全部移入回收站。确定？`)) return;
+  const msg = $("#storage-msg");
+  if (msg) msg.textContent = "处理中…";
+  try {
+    await api("/api/dedup/scan", { method: "POST", body: "{}" });
+    const r = await api("/api/dedup/resolve-all", {
+      method: "POST",
+      body: JSON.stringify({ strategy }),
+    });
+    if (msg) msg.textContent = r.message || "完成";
+    alert(r.message || "完成");
+    await loadDedupList();
+    await loadStorage().catch(() => {});
+    await loadTree(true).catch(() => {});
+  } catch (e) {
+    if (msg) msg.textContent = e.message || String(e);
+    alert(e.message || e);
+  }
+}
+$("#btn-dedup-resolve-oldest")?.addEventListener("click", () => resolveAllDedup("oldest"));
+$("#btn-dedup-resolve-newest")?.addEventListener("click", () => resolveAllDedup("newest"));
+
+
+
+/* —— 实况预览 —— */
+function lbStopLive() {
+  lbLivePlaying = false;
+  if (lbLiveVideo) {
+    try {
+      lbLiveVideo.pause();
+      lbLiveVideo.removeAttribute("src");
+      lbLiveVideo.load();
+    } catch (_) {}
+    lbLiveVideo.classList.add("hidden");
+  }
+  $("#lb-live")?.classList.add("hidden");
+  $("#lb-live")?.setAttribute("aria-pressed", "false");
+  lbImg?.classList.remove("hidden");
+}
+
+function lbSetupLive(data) {
+  lbStopLive();
+  lbLivePath = data?.has_live && data?.live_video_path ? data.live_video_path : null;
+  const btn = $("#lb-live");
+  if (!lbLivePath || !btn) return;
+  btn.classList.remove("hidden");
+  btn.textContent = "实况";
+}
+
+async function lbToggleLive() {
+  if (!lbLivePath || !lbLiveVideo) return;
+  if (lbLivePlaying) {
+    lbLiveVideo.pause();
+    lbLiveVideo.classList.add("hidden");
+    lbImg?.classList.remove("hidden");
+    lbLivePlaying = false;
+    $("#lb-live")?.setAttribute("aria-pressed", "false");
+    $("#lb-live").textContent = "实况";
+    return;
+  }
+  const url = `/api/file?path=${encodeURIComponent(lbLivePath)}&t=${Date.now()}`;
+  lbLiveVideo.src = url;
+  lbLiveVideo.classList.remove("hidden");
+  lbImg?.classList.add("hidden");
+  try {
+    await lbLiveVideo.play();
+    lbLivePlaying = true;
+    $("#lb-live")?.setAttribute("aria-pressed", "true");
+    $("#lb-live").textContent = "停实况";
+  } catch (e) {
+    lbStopLive();
+    alert("实况视频播放失败");
+  }
+}
+
+$("#lb-live")?.addEventListener("click", () => lbToggleLive().catch(console.error));
+
+// 长按缩略图也可触发挥实况：在灯箱图上按住
+let _livePressTimer = null;
+lbViewport?.addEventListener("pointerdown", (e) => {
+  if (!lbLivePath || lb.kind === "video") return;
+  if (e.button && e.button !== 0) return;
+  _livePressTimer = setTimeout(() => {
+    if (!lbLivePlaying) lbToggleLive().catch(console.error);
+  }, 420);
+});
+["pointerup", "pointercancel", "pointerleave"].forEach((ev) => {
+  lbViewport?.addEventListener(ev, () => {
+    if (_livePressTimer) {
+      clearTimeout(_livePressTimer);
+      _livePressTimer = null;
+    }
+  });
 });
 
 /* Boot */

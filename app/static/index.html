@@ -2,9 +2,9 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title id="doc-title">小树时光相册</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=2.0.1" />
   <link rel="icon" href="/api/brand/icon" />
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css" />
   <script>
@@ -53,6 +53,16 @@
           </div>
         </div>
       </div>
+      <div class="browse-tools">
+        <button type="button" class="btn ghost" id="btn-search-toggle" aria-expanded="false">搜索</button>
+        <form id="search-bar" class="search-bar hidden" autocomplete="off">
+          <input type="search" id="search-q" placeholder="搜索标题、地点、描述、文件名…" maxlength="80" />
+          <button type="submit" class="btn primary" id="btn-search">查找</button>
+          <button type="button" class="btn ghost" id="btn-search-close">收起</button>
+          <button type="button" class="btn ghost hidden" id="btn-search-clear">清除结果</button>
+        </form>
+      </div>
+      <div id="search-root" class="search-root hidden" aria-live="polite"></div>
       <div id="browse-empty" class="empty hidden">相册里还没有照片，去「相册管理 → 入库」吧。</div>
       <div id="journey-root" class="journey"></div>
       <div id="classic-root" class="classic hidden" aria-label="经典模式"></div>
@@ -87,6 +97,7 @@
             <button type="button" class="seg-btn" data-manage="import">入库</button>
             <button type="button" class="seg-btn" data-manage="trash">回收站</button>
             <button type="button" class="seg-btn" data-manage="settings">设置</button>
+            <button type="button" class="seg-btn" data-manage="storage">存储</button>
             <button type="button" class="seg-btn" data-manage="visitors">访问数据</button>
             <button type="button" class="seg-btn" data-manage="about">关于</button>
           </div>
@@ -100,7 +111,7 @@
 
       <div id="manage-import" class="manage-pane hidden">
         <p class="hint" id="import-hint">
-          支持手机/平板相册导入（含苹果 HEIC、实况照片、MOV）。原件按字节拷贝入库，不转码、不压画质；元数据从 EXIF/侧车读取。
+          支持手机/平板相册导入（含苹果 HEIC、实况照片、MOV）。原件按字节拷贝入库，不转码、不压画质；上传后自动解析 EXIF/侧车，可直接编辑后入库。
           可拖放到下方区域，或点「从相册选择 / 选择文件夹」。不想入库的项：勾选后点「移除选中」，或「清空待入库」。
         </p>
         <div id="drop-zone" class="drop-zone" tabindex="0">
@@ -111,6 +122,19 @@
             <button type="button" id="btn-pick-dir" class="btn ghost">选择文件夹</button>
           </div>
           <p id="drop-status" class="drop-status"></p>
+        <div id="upload-queue" class="upload-queue hidden">
+          <div class="upload-queue-head">
+            <strong>上传队列</strong>
+            <span id="upload-queue-summary" class="muted"></span>
+            <div class="upload-queue-actions">
+              <button type="button" class="btn ghost" id="btn-queue-pause">暂停</button>
+              <button type="button" class="btn ghost" id="btn-queue-resume">继续</button>
+              <button type="button" class="btn ghost" id="btn-queue-retry">重试失败</button>
+              <button type="button" class="btn ghost" id="btn-queue-clear">清空已完成</button>
+            </div>
+          </div>
+          <ul id="upload-queue-list" class="upload-queue-list"></ul>
+        </div>
         </div>
         <input
           type="file"
@@ -124,7 +148,7 @@
         <div class="import-toolbar">
           <label><input type="checkbox" id="check-all" /> 全选</label>
           <button type="button" id="btn-select-same-day" class="btn ghost">勾选同日</button>
-          <button type="button" id="btn-parse" class="btn ghost">解析源数据</button>
+          <button type="button" id="btn-parse" class="btn ghost" title="已自动解析；仅在需重读 EXIF 时点此">重新解析</button>
           <button type="button" id="btn-batch-import" class="btn ghost">批量编辑选中</button>
           <button type="button" id="btn-reload-import" class="btn ghost">刷新列表</button>
           <button type="button" id="btn-discard-import" class="btn ghost">移除选中</button>
@@ -144,6 +168,7 @@
           </div>
           <div class="actions trash-actions">
             <button type="button" id="btn-trash-select" class="btn ghost">选择</button>
+            <button type="button" id="btn-trash-select-all" class="btn ghost hidden">全选</button>
             <button type="button" id="btn-trash-restore" class="btn ghost hidden">恢复</button>
             <button type="button" id="btn-trash-purge" class="btn ghost hidden">彻底删除</button>
             <button type="button" id="btn-trash-refresh" class="btn ghost">刷新</button>
@@ -152,6 +177,20 @@
         <p class="hint">删除的照片会先到这里。可恢复回原路径，或彻底删除（不可恢复）。</p>
         <div id="trash-empty" class="empty hidden">回收站是空的。</div>
         <div id="trash-grid" class="photo-grid trash-grid" aria-label="回收站"></div>
+      </div>
+
+      
+      <div id="manage-storage" class="manage-pane hidden">
+        <p class="hint">仅超级用户可见。统计相册原片、回收站、缩略图、离线地图包与磁盘水位。</p>
+        <div class="storage-toolbar">
+          <button type="button" id="btn-storage-refresh" class="btn ghost">刷新占用</button>
+          <button type="button" id="btn-dedup-check" class="btn primary">检查重复项</button>
+          <button type="button" id="btn-dedup-resolve-oldest" class="btn ghost">一键处理（留最早）</button>
+          <button type="button" id="btn-dedup-resolve-newest" class="btn ghost">一键处理（留最新）</button>
+          <span id="storage-msg" class="muted"></span>
+        </div>
+        <div id="storage-cards" class="storage-cards"></div>
+        <div id="dedup-root" class="dedup-root"></div>
       </div>
 
       <div id="manage-settings" class="manage-pane hidden">
@@ -438,8 +477,8 @@
         <div class="about-page">
           <header class="about-hero">
             <div>
-              <h2 class="about-hero-title">小树时光相册 <span class="about-ver">v1.0</span></h2>
-              <p class="about-author muted">作者 · xiaoshu</p>
+              <h2 class="about-hero-title">小树时光相册 <span class="about-ver">v2.0.0</span></h2>
+              <p class="about-author muted">作者 · xiaoshu · 定版 2026-09-24</p>
             </div>
           </header>
 
@@ -453,10 +492,10 @@
           <section class="about-section" aria-labelledby="about-feat-title">
             <h3 id="about-feat-title" class="about-section-title">主要功能</h3>
             <ul class="about-features">
-              <li>相册浏览：时光 / 经典 / 地图（高德或离线包）</li>
-              <li>入库整理：解析元数据、批量修正、按规范命名</li>
+              <li>相册浏览：时光 / 经典 / 地图；搜索；实况预览；下载原图</li>
+              <li>入库：自动解析元数据、上传队列、内容去重</li>
               <li>单图编辑：旋转裁剪、视频剪辑封面、旁白录音</li>
-              <li>超级用户与分享二维码（免登、范围权限）</li>
+              <li>超级用户与分享二维码；存储占用与重复项处理</li>
               <li>回收站软删除；媒资 SQLite 索引加速浏览</li>
             </ul>
             <p class="muted about-note">文件命名：<code>年/月/YYYY-MM-DD-HHMMSS-简述-md5.扩展名</code></p>
@@ -477,6 +516,8 @@
       <div class="lb-top-right">
         <button type="button" class="lb-text-btn" id="lb-play" aria-pressed="false">播放</button>
         <button type="button" class="lb-text-btn" id="lb-play-settings" title="播放设置">设置</button>
+        <button type="button" class="lb-text-btn hidden" id="lb-live" aria-pressed="false">实况</button>
+        <button type="button" class="lb-text-btn" id="lb-download" title="下载原文件">下载</button>
         <button type="button" class="lb-text-btn" id="lb-edit">编辑</button>
       </div>
     </header>
@@ -519,6 +560,7 @@
           <div class="lb-stage" id="lb-stage">
             <img id="lb-img" alt="" draggable="false" />
             <video id="lb-video" class="hidden" controls playsinline preload="metadata"></video>
+            <video id="lb-live-video" class="hidden lb-live-video" playsinline muted loop preload="metadata"></video>
           </div>
         </div>
       </div>
@@ -616,7 +658,10 @@
           </div>
           <p id="narration-status" class="muted"></p>
         </div>
-        <button type="button" id="btn-save" class="btn primary">保存</button>
+        <div class="actions detail-save-row">
+          <button type="button" id="btn-detail-download" class="btn ghost">下载原文件</button>
+          <button type="button" id="btn-save" class="btn primary">保存</button>
+        </div>
         <p id="detail-msg" class="muted"></p>
       </div>
     </div>
@@ -674,6 +719,6 @@
     </div>
   </dialog>
 
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=2.0.1" defer></script>
 </body>
 </html>

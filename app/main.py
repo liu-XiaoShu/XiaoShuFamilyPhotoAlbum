@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import mimetypes
+from urllib.parse import quote
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -40,7 +42,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="小树时光相册", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="小树时光相册", version="2.0.0", lifespan=lifespan)
 
 
 def _skip_visitor_log(path: str) -> bool:
@@ -174,6 +176,15 @@ class TrashPaths(BaseModel):
 
 class TrashIds(BaseModel):
     ids: List[str]
+
+class DedupResolve(BaseModel):
+    keep: str
+    remove: List[str] = Field(default_factory=list)
+
+
+class DedupResolveAll(BaseModel):
+    strategy: str = "oldest"  # oldest | newest
+
 
 
 class AuthSetup(BaseModel):
@@ -309,7 +320,8 @@ def health():
     return {
         "ok": True,
         "name": config.album_title,
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "released_at": "2026-09-24",
         "author": "xiaoshu",
     }
 
@@ -772,7 +784,8 @@ def map_tile(z: int, x: int, y: int):
 
 @app.get("/api/import/list")
 def import_list(p: dict = Depends(require_upload)):
-    return {"items": library.list_import_images()}
+    """列表即带元数据，前端可直接编辑，无需再点解析。"""
+    return {"items": library.list_import_images(with_meta=True)}
 
 
 @app.post("/api/import/upload")
@@ -781,13 +794,48 @@ async def import_upload(
     paths: Optional[List[str]] = Form(None),
     p: dict = Depends(require_upload),
 ):
+    """流式写入导入目录，避免大视频整文件进内存。"""
+    from .services.naming import MEDIA_EXTS, unique_path
     path_list = paths or []
-    payload = []
+    root = config.import_root
+    root.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    skipped: list[str] = []
     for i, f in enumerate(files):
         rel = path_list[i] if i < len(path_list) and path_list[i] else (f.filename or "image")
-        data = await f.read()
-        payload.append((rel, data))
-    return library.save_uploads(payload)
+        rel = (rel or "").replace("\\", "/").strip().lstrip("/")
+        parts = [p for p in Path(rel).parts if p not in ("", ".", "..")]
+        if not parts:
+            skipped.append(rel or "(空路径)")
+            continue
+        name = parts[-1]
+        if Path(name).suffix.lower() not in MEDIA_EXTS:
+            skipped.append("/".join(parts))
+            continue
+        dest = root.joinpath(*parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest, _ = unique_path(dest)
+        try:
+            with dest.open("wb") as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            from .services.ops import ensure_host_perms
+            ensure_host_perms(dest.parent, is_dir=True)
+            ensure_host_perms(dest)
+            saved.append(str(dest.relative_to(root)).replace("\\", "/"))
+        except Exception:
+            try:
+                if dest.exists():
+                    dest.unlink()
+            except OSError:
+                pass
+            skipped.append("/".join(parts))
+        finally:
+            await f.close()
+    return {"ok": True, "saved": saved, "skipped": skipped, "count": len(saved)}
 
 
 @app.post("/api/import/parse")
@@ -847,6 +895,122 @@ def import_ingest(body: IngestBatch, p: dict = Depends(require_upload)):
             results.append({"ok": False, "path": item.path, "message": str(e)})
     return {"results": results}
 
+
+
+
+@app.get("/api/storage")
+def storage_stats(p: dict = Depends(require_settings)):
+    """仅超级用户：磁盘与各目录占用。"""
+    from .services import ops
+    return ops.storage_overview()
+
+
+@app.get("/api/search")
+def search_photos(
+    q: str = "",
+    limit: int = 60,
+    offset: int = 0,
+    p: dict = Depends(current_principal),
+):
+    return media_index.search_media(
+        q,
+        limit=limit,
+        offset=offset,
+        **_scope_kwargs(p),
+    )
+
+
+@app.get("/api/dedup")
+def dedup_list(limit: int = 100, p: dict = Depends(require_settings)):
+    from .services import ops
+    return ops.list_duplicate_groups(limit=limit)
+
+
+@app.post("/api/dedup/scan")
+def dedup_scan(p: dict = Depends(require_settings)):
+    """为缺少 content_hash 的索引条目补算（可能较慢）。"""
+    from .services.ops import content_hash_of
+    from .services.library import album_path
+    filled = 0
+    skipped = 0
+    with media_index.connect() as con:
+        rows = con.execute(
+            "SELECT path FROM media WHERE content_hash IS NULL OR TRIM(content_hash) = ''"
+        ).fetchall()
+    for r in rows:
+        rel = r["path"]
+        try:
+            full = album_path(rel)
+            if not full.is_file():
+                skipped += 1
+                continue
+            h = content_hash_of(full)
+            media_index.set_content_hash(rel, h)
+            filled += 1
+        except Exception:
+            skipped += 1
+    return {"ok": True, "filled": filled, "skipped": skipped, "message": f"已补算 {filled} 条"}
+
+
+@app.post("/api/dedup/resolve")
+def dedup_resolve(body: DedupResolve, p: dict = Depends(require_settings)):
+    """保留 keep，将其余 remove 移入回收站。"""
+    keep = (body.keep or "").replace("\\", "/").lstrip("/")
+    remove = [(x or "").replace("\\", "/").lstrip("/") for x in (body.remove or []) if x]
+    remove = [x for x in remove if x and x != keep]
+    if not keep:
+        raise HTTPException(400, "请指定要保留的文件")
+    if not remove:
+        return {"ok": True, "trashed": 0, "message": "没有需要处理的重复项"}
+    _guard_album_path(keep, p)
+    for rel in remove:
+        _guard_album_path(rel, p)
+    try:
+        r = library.trash_batch(remove)
+        return {
+            "ok": True,
+            "keep": keep,
+            "trashed": sum(1 for x in (r.get("results") or []) if x.get("ok")),
+            "results": r.get("results") or [],
+            "message": f"已保留 1 项，移入回收站 {sum(1 for x in (r.get('results') or []) if x.get('ok'))} 项",
+        }
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/dedup/resolve-all")
+def dedup_resolve_all(body: DedupResolveAll = DedupResolveAll(), p: dict = Depends(require_settings)):
+    """每组重复自动保留一份（最早或最新），其余进回收站。"""
+    from .services import ops
+    strategy = (body.strategy or "oldest").lower()
+    if strategy not in ("oldest", "newest"):
+        raise HTTPException(400, "strategy 须为 oldest 或 newest")
+    data = ops.list_duplicate_groups(limit=200)
+    kept = 0
+    trashed = 0
+    details = []
+    for g in data.get("groups") or []:
+        items = list(g.get("items") or [])
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda it: (it.get("datetime") or "", it.get("path") or ""))
+        keep_it = items[0] if strategy == "oldest" else items[-1]
+        remove = [it["path"] for it in items if it["path"] != keep_it["path"]]
+        for rel in remove:
+            _guard_album_path(rel, p)
+        _guard_album_path(keep_it["path"], p)
+        r = library.trash_batch(remove)
+        n = sum(1 for x in (r.get("results") or []) if x.get("ok"))
+        kept += 1
+        trashed += n
+        details.append({"keep": keep_it["path"], "trashed": n})
+    return {
+        "ok": True,
+        "groups": kept,
+        "trashed": trashed,
+        "details": details,
+        "message": f"已处理 {kept} 组，移入回收站 {trashed} 项",
+    }
 
 @app.get("/api/timeline")
 def timeline(p: dict = Depends(current_principal)):
@@ -1105,23 +1269,42 @@ def trash_list(sort: str = "deleted_at", p: dict = Depends(require_trash)):
     if sort not in ("deleted_at", "media_datetime"):
         raise HTTPException(400, "sort 须为 deleted_at 或 media_datetime")
     data = library.list_trash(sort=sort)
-    scopes = p.get("album_scopes") or []
-    if scopes:
+    # 超管看全部；分享访客仅看自己可见范围的条目
+    if not (p.get("is_admin") or p.get("open_mode")):
         items = [
             it
             for it in (data.get("items") or [])
-            if auth.path_allowed(it.get("original_path") or "", scopes)
+            if auth.media_visible(it.get("original_path") or "", p)
         ]
         data = {**data, "items": items, "count": len(items)}
     return data
+
+
+def _trash_ids_visible(ids: list[str], p: dict) -> list[str]:
+    """恢复/删除前校验条目对当前主体可见。"""
+    if p.get("is_admin") or p.get("open_mode"):
+        return ids
+    allowed = []
+    data = library.list_trash()
+    by_id = {it.get("id"): it for it in (data.get("items") or [])}
+    for tid in ids:
+        it = by_id.get(tid)
+        if not it:
+            continue
+        if auth.media_visible(it.get("original_path") or "", p):
+            allowed.append(tid)
+    return allowed
 
 
 @app.post("/api/trash/restore")
 def trash_restore(body: TrashIds, p: dict = Depends(require_trash)):
     if not body.ids:
         raise HTTPException(400, "未选择条目")
+    ids = _trash_ids_visible(body.ids, p)
+    if not ids:
+        raise HTTPException(403, "无权操作所选回收站条目")
     try:
-        return library.restore_trash(body.ids)
+        return library.restore_trash(ids)
     except Exception as e:
         raise HTTPException(400, str(e))
 
@@ -1130,6 +1313,7 @@ def trash_restore(body: TrashIds, p: dict = Depends(require_trash)):
 def trash_purge(body: TrashIds, p: dict = Depends(require_purge)):
     if not body.ids:
         raise HTTPException(400, "未选择条目")
+    # 彻底删除仅超管（require_purge）；仍按 id 列表执行
     try:
         return library.purge_trash(body.ids)
     except Exception as e:
@@ -1195,6 +1379,37 @@ def file_raw(path: str, source: str = "album", p: dict = Depends(current_princip
         if not fp.exists():
             raise HTTPException(404, "文件不存在")
         return FileResponse(fp)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+
+@app.get("/api/download")
+def download_file(path: str, source: str = "album", p: dict = Depends(current_principal)):
+    """下载原文件（附件方式，触发浏览器保存）。"""
+    try:
+        if source == "import":
+            if not (p.get("can_upload") or p.get("open_mode")):
+                raise HTTPException(403, "无权下载导入区文件")
+            fp = library.import_path(path)
+            filename = fp.name
+        else:
+            path = _guard_album_path(path, p)
+            fp = library.album_path(path)
+            filename = Path(path).name or fp.name
+        if not fp.exists() or not fp.is_file():
+            raise HTTPException(404, "文件不存在")
+        media_type, _ = mimetypes.guess_type(str(fp))
+        media_type = media_type or "application/octet-stream"
+        # RFC 5987：中文文件名
+        star = quote(filename)
+        headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{star}",
+            "Cache-Control": "no-store",
+        }
+        return FileResponse(fp, media_type=media_type, filename=filename, headers=headers)
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(400, str(e))
 
