@@ -21,7 +21,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 PORTAL_TOOL_ID="album"
-HUB_PORTAL="${HUB_PORTAL:-/home/xiaoshu/apps/xiaoshu-hub/data/portal.json}"
+HUB_PORTAL="${HUB_PORTAL:-/opt/xiaoshu-hub/data/portal.json}"
 
 ensure_dirs() {
   mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo data/certs
@@ -266,7 +266,7 @@ case "$cmd" in
                     干净卸载；--purge 会删除照片请谨慎
 
 示例:
-  cd ~/apps/xiaoshu-album
+  cd /path/to/xiaoshu-album
   ./scripts/pi/deploy.sh
   ./scripts/pi/set-http.sh
   ./scripts/pi/set-https.sh

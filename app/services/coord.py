@@ -10,7 +10,23 @@ _EE = 0.00669342162296594323
 
 
 def out_of_china(lat: float, lng: float) -> bool:
-    return not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271)
+    """是否不做 GCJ-02 偏移。
+
+    高德等在港澳台通常按 WGS-84 显示；对这三地做火星坐标偏移会把点甩偏，
+    放大后像「没有标记」。
+    """
+    if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
+        return True
+    # 台湾
+    if 119.3 <= lng <= 122.1 and 21.8 <= lat <= 25.4:
+        return True
+    # 香港
+    if 113.80 <= lng <= 114.45 and 22.15 <= lat <= 22.58:
+        return True
+    # 澳门
+    if 113.52 <= lng <= 113.63 and 22.10 <= lat <= 22.25:
+        return True
+    return False
 
 
 def _transform_lat(x: float, y: float) -> float:

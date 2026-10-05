@@ -8,11 +8,13 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ./album:/app/album
-      - ./inbox:/app/inbox
-      - ./data:/app/data
+      # 相册 / 缩略图 / data 建议放同一块数据盘，入库可用 rename
+      - /mnt/album-data:/mnt/album-data
+      - /mnt/album-data/data:/app/data
+      - /mnt/album-data/inbox:/app/inbox
       - ./config.json:/app/config.json
+    command: ["python", "run.py", "--https"]
     environment:
       - TZ=Asia/Shanghai
-      - HOST_UID=1001
-      - HOST_GID=1001
+      - HOST_UID=1000
+      - HOST_GID=1000

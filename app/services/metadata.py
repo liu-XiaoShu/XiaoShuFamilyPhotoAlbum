@@ -9,7 +9,7 @@ from pathlib import Path
 import piexif
 from PIL import Image, PngImagePlugin
 
-from .naming import guess_datetime_from_name, parse_title_from_filename
+from .naming import guess_datetime_from_name, parse_datetime, parse_title_from_filename
 
 REFLECTION_MARK = "---感悟---"
 XMP_NS = "xiaoshu"
@@ -119,7 +119,7 @@ def _exif_to_iso(value: bytes | str | None) -> str | None:
             )
         except ValueError:
             continue
-    return text
+    return None
 
 
 def _split_description(raw: str | None) -> tuple[str | None, str | None]:
@@ -202,6 +202,52 @@ def _xml_escape(s: str) -> str:
     )
 
 
+def _read_jpeg_exif_fast(path: Path, meta: PhotoMeta) -> bool:
+    """JPEG：用 piexif 直接读文件 EXIF，避免 Image.open 全图解码。成功返回 True。"""
+    try:
+        exif = piexif.load(str(path))
+    except Exception:
+        return False
+    try:
+        z0 = exif.get("0th", {}) or {}
+        ex = exif.get("Exif", {}) or {}
+        if piexif.ExifIFD.DateTimeOriginal in ex:
+            meta.datetime = _exif_to_iso(ex[piexif.ExifIFD.DateTimeOriginal])
+        elif piexif.ImageIFD.DateTime in z0:
+            meta.datetime = _exif_to_iso(z0[piexif.ImageIFD.DateTime])
+        if piexif.ImageIFD.ImageDescription in z0:
+            raw = z0[piexif.ImageIFD.ImageDescription]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            d, r = _split_description(raw)
+            meta.description = meta.description or d
+            meta.reflection = meta.reflection or r
+        if piexif.ImageIFD.XPTitle in z0:
+            title = _decode_xp_string(z0[piexif.ImageIFD.XPTitle])
+            if title:
+                meta.title = meta.title or title
+        if piexif.ImageIFD.XPComment in z0 and not meta.location:
+            comment = _decode_xp_string(z0[piexif.ImageIFD.XPComment])
+            if comment and comment.startswith("地点:"):
+                meta.location = comment[3:].strip() or None
+        gps = exif.get("GPS") or {}
+        if piexif.GPSIFD.GPSLatitude in gps and piexif.GPSIFD.GPSLongitude in gps:
+            lat = _dms_to_deg(
+                gps[piexif.GPSIFD.GPSLatitude],
+                gps.get(piexif.GPSIFD.GPSLatitudeRef),
+            )
+            lng = _dms_to_deg(
+                gps[piexif.GPSIFD.GPSLongitude],
+                gps.get(piexif.GPSIFD.GPSLongitudeRef),
+            )
+            if lat is not None and lng is not None:
+                meta.lat = lat
+                meta.lng = lng
+        return True
+    except Exception:
+        return False
+
+
 def read_meta(path: Path) -> PhotoMeta:
     from .naming import is_heic, is_video
 
@@ -217,6 +263,16 @@ def read_meta(path: Path) -> PhotoMeta:
 
     meta = PhotoMeta()
     suffix = path.suffix.lower()
+
+    # JPEG/JPG：优先 piexif 快路径，跳过 Image.open 像素解码
+    if suffix in {".jpg", ".jpeg"} and _read_jpeg_exif_fast(path, meta):
+        if not parse_datetime(meta.datetime):
+            guessed = guess_datetime_from_name(path.name) or guess_datetime_from_name(str(path))
+            if guessed:
+                meta.datetime = guessed.strftime("%Y-%m-%d %H:%M:%S")
+        if not meta.title:
+            meta.title = parse_title_from_filename(path.name)
+        return meta
 
     try:
         with Image.open(path) as im:
@@ -305,8 +361,8 @@ def read_meta(path: Path) -> PhotoMeta:
             except (TypeError, ValueError):
                 pass
 
-    if not meta.datetime:
-        guessed = guess_datetime_from_name(path.name)
+    if not parse_datetime(meta.datetime):
+        guessed = guess_datetime_from_name(path.name) or guess_datetime_from_name(str(path))
         if guessed:
             meta.datetime = guessed.strftime("%Y-%m-%d %H:%M:%S")
 

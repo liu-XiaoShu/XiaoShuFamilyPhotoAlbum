@@ -1,0 +1,20 @@
+version: "3.3"
+
+services:
+  album:
+    build: .
+    image: xiaoshu-album:latest
+    container_name: xiaoshu-album
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # 外接盘示例路径，部署时改成实际挂载点
+      - /mnt/album-data:/mnt/album-data
+      - /mnt/album-data/data:/app/data
+      - /mnt/album-data/inbox:/app/inbox
+      - ./config.json:/app/config.json
+    command: ["python", "run.py", "--https"]
+    environment:
+      - TZ=Asia/Shanghai
+      - HOST_UID=1000
+      - HOST_GID=1000

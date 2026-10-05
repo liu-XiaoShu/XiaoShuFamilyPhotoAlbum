@@ -8,8 +8,19 @@ __pycache__/
 .DS_Store
 *.AppImage
 
+.env
+.env.*
+*.pem
+*.key
+config.json.bad_dir
+
 # 本机配置（含绝对路径 / 个性化标题）
 config.json
+
+# 本地 compose 备份（可能含本机路径）
+docker-compose.yml.bak*
+*.bak
+*.bak.*
 
 # 用户媒资（勿入库）
 album/**
@@ -19,6 +30,9 @@ inbox/**
 album/.trash/
 
 # 运行时数据
+data/geo/*.sqlite
+data/geo/*.sqlite-*
+data/README-MOVED.txt
 data/thumbs/**
 !data/thumbs/.gitkeep
 data/auth.sqlite

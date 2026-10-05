@@ -5,6 +5,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ from ..config import ROOT
 DB_PATH = ROOT / "data" / "auth.sqlite"
 SESSION_COOKIE = "xiaoshu_session"
 SESSION_DAYS = 30
-PBKDF2_ITERS = 120_000
+PBKDF2_ITERS = 80_000
 
 
 def _now() -> datetime:
@@ -533,15 +534,26 @@ def _share_dict(row: sqlite3.Row) -> dict:
     }
 
 
-def qr_png_bytes(text: str, box_size: int = 6) -> bytes:
+_qr_cache: dict[str, tuple[float, bytes]] = {}
+
+
+def qr_png_bytes(text: str, box_size: int = 5) -> bytes:
     import io
 
     import qrcode
 
+    now = time.time()
+    hit = _qr_cache.get(text)
+    if hit and now - hit[0] < 3600:
+        return hit[1]
     qr = qrcode.QRCode(version=None, box_size=box_size, border=2)
     qr.add_data(text)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return buf.getvalue()
+    data = buf.getvalue()
+    if len(_qr_cache) > 64:
+        _qr_cache.clear()
+    _qr_cache[text] = (now, data)
+    return data

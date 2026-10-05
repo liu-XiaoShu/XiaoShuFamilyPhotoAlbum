@@ -11,6 +11,7 @@ const state = {
   galleryPaths: [],
   galleryIndex: 0,
   reopenLightbox: false,
+  editReturnPath: null,
   thumbBust: 0,
   zoom: 1,
   panX: 0,
@@ -20,6 +21,10 @@ const state = {
   fitScale: 1,
   crop: { left: 0.1, top: 0.1, right: 0.9, bottom: 0.9 },
   viewMode: "journey",
+  mediaKindFilter: (() => {
+    const v = localStorage.getItem("xiaoshu_media_kind") || "all";
+    return ["all", "image", "video"].includes(v) ? v : "all";
+  })(),
   section: "browse",
   manageTab: (() => {
     const m = localStorage.getItem("xiaoshu_manage") || "album";
@@ -39,10 +44,15 @@ const state = {
   shareYears: new Set(),
   shareMediaPaths: new Set(),
   shareMediaLoaded: false,
+  shareMediaVisible: [],
+  shareSearchItems: [],
   selectMode: false,
   selectScope: null,
   selectedPaths: new Set(),
   batchTarget: null,
+  importItemCount: 0,
+  _detachedImportList: null,
+  _importListParent: null,
   map: null,
   mapLayer: null,
   mapMarkers: null,
@@ -50,6 +60,57 @@ const state = {
   mapPoints: null,
   mapPackPoll: null,
 };
+
+function askConfirm(message) {
+  // Firefox：页面已有 <dialog> 时 window.confirm/alert 常直接返回 false 且不弹窗
+  return new Promise((resolve) => {
+    const dlg = document.getElementById("app-confirm-dialog");
+    const msgEl = document.getElementById("app-confirm-msg");
+    const yes = document.getElementById("app-confirm-yes");
+    const no = document.getElementById("app-confirm-no");
+    if (!dlg || !msgEl || !yes || !no || typeof dlg.showModal !== "function") {
+      resolve(window.confirm(message));
+      return;
+    }
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      yes.removeEventListener("click", onYes);
+      no.removeEventListener("click", onNo);
+      dlg.removeEventListener("cancel", onCancel);
+      dlg.removeEventListener("close", onClose);
+      try {
+        if (dlg.open) dlg.close();
+      } catch (_) {}
+      resolve(ok);
+    };
+    const onYes = (e) => {
+      e.preventDefault();
+      finish(true);
+    };
+    const onNo = (e) => {
+      e.preventDefault();
+      finish(false);
+    };
+    const onCancel = (e) => {
+      e.preventDefault();
+      finish(false);
+    };
+    const onClose = () => finish(false);
+    msgEl.textContent = message;
+    yes.addEventListener("click", onYes);
+    no.addEventListener("click", onNo);
+    dlg.addEventListener("cancel", onCancel);
+    dlg.addEventListener("close", onClose);
+    try {
+      if (dlg.open) dlg.close();
+      dlg.showModal();
+    } catch (_) {
+      finish(window.confirm(message));
+    }
+  });
+}
 
 async function api(url, options = {}) {
   const opts = { ...options };
@@ -59,6 +120,7 @@ async function api(url, options = {}) {
     headers["Content-Type"] = "application/json";
   }
   opts.headers = headers;
+  if (!opts.credentials) opts.credentials = "same-origin";
   const res = await fetch(url, opts);
   if (!res.ok) {
     let msg = res.statusText;
@@ -106,6 +168,13 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
+function canonicalizeAlbumPath(p) {
+  const s = String(p || "").replace(/\\/g, "/");
+  const i = s.indexOf(".narration.");
+  if (i > 0) return s.slice(0, i);
+  return s;
+}
+
 /* 一级：相册浏览 / 相册管理 */
 function applySection() {
   const section = state.section === "manage" ? "manage" : "browse";
@@ -144,7 +213,10 @@ function applyManageTab() {
   if (tab !== "album" && state.selectMode) setSelectMode(false);
   if (tab !== "trash" && state.trashSelectMode) setTrashSelectMode(false);
   if (tab === "album") loadTree().catch(console.error);
-  if (tab === "import") loadImport().catch(console.error);
+  if (tab === "import") {
+    resetImportUiState();
+    loadImport().catch(console.error);
+  }
   if (tab === "trash") loadTrash().catch(console.error);
   if (tab === "settings") loadSettings().catch(console.error);
   if (tab === "storage") loadStorage().catch(console.error);
@@ -167,7 +239,10 @@ function manageTabsAllowed() {
 function applyCapabilities(me) {
   state.me = me || state.me || {};
   const m = state.me;
-  document.body.classList.toggle("cap-no-edit", !(m.can_edit || m.open_mode));
+  document.body.classList.toggle(
+    "cap-no-edit",
+    !(m.can_edit || m.open_mode || m.kind === "share")
+  );
   const who = $("#auth-who");
   const role = $("#auth-role");
   const chip = $("#auth-chip");
@@ -256,7 +331,7 @@ document.querySelectorAll('.seg[aria-label="管理功能"] .seg-btn').forEach((b
 
 /* Timeline / 浏览模式 */
 const MONTH_PAGE = 120;
-const CLASSIC_PAGE = 80;
+const CLASSIC_PAGE = 40;
 
 async function loadOutline(force = false, { brief = true } = {}) {
   const have = state.outlineCache;
@@ -272,45 +347,97 @@ async function loadOutline(force = false, { brief = true } = {}) {
   return data;
 }
 
+function mediaKindQuery() {
+  const k = state.mediaKindFilter || "all";
+  return k === "image" || k === "video" ? k : "";
+}
+
+function monthMatchesKindFilter(m) {
+  const f = state.mediaKindFilter || "all";
+  if (f === "video") return (m.video_count || 0) > 0;
+  if (f === "image") return (m.image_count || (m.photo_count || 0) - (m.video_count || 0)) > 0;
+  return (m.photo_count || 0) > 0;
+}
+
+function yearMatchesKindFilter(y) {
+  const f = state.mediaKindFilter || "all";
+  if (f === "video") {
+    return (y.video_count != null
+      ? y.video_count
+      : (y.months || []).reduce((n, m) => n + (m.video_count || 0), 0)) > 0;
+  }
+  if (f === "image") {
+    const img =
+      y.image_count != null
+        ? y.image_count
+        : (y.months || []).reduce(
+            (n, m) => n + (m.image_count || Math.max(0, (m.photo_count || 0) - (m.video_count || 0))),
+            0
+          );
+    return img > 0;
+  }
+  return (y.photo_count || (y.months || []).reduce((n, m) => n + (m.photo_count || 0), 0)) > 0;
+}
+
+function clearMonthPhotoCache() {
+  state.monthPhotoCache = {};
+}
+
 async function fetchMonthPhotos(month, offset = 0, limit = MONTH_PAGE) {
-  const key = `${month}@${offset}@${limit}`;
+  const kind = mediaKindQuery() || "all";
+  const key = `${month}@${offset}@${limit}@${kind}`;
   if (state.monthPhotoCache[key]) return state.monthPhotoCache[key];
-  const data = await api(
-    `/api/timeline/month?month=${encodeURIComponent(month)}&offset=${offset}&limit=${limit}`
-  );
+  const qs = new URLSearchParams({
+    month,
+    offset: String(offset),
+    limit: String(limit),
+  });
+  if (kind !== "all") qs.set("kind", kind);
+  const data = await api(`/api/timeline/month?${qs.toString()}`);
   state.monthPhotoCache[key] = data;
   return data;
 }
 
 async function fetchScopePaths(scopeKey) {
   if (!scopeKey) return [];
+  const kind = mediaKindQuery();
+  const kindQs = kind ? `&kind=${encodeURIComponent(kind)}` : "";
   if (scopeKey.startsWith("year:")) {
     const y = scopeKey.slice(5);
-    const r = await api(`/api/timeline/paths?year=${encodeURIComponent(y)}`);
+    const r = await api(`/api/timeline/paths?year=${encodeURIComponent(y)}${kindQs}`);
     return r.paths || [];
   }
   if (scopeKey.startsWith("month:")) {
     const m = scopeKey.slice(6);
-    const r = await api(`/api/timeline/paths?month=${encodeURIComponent(m)}`);
+    const r = await api(`/api/timeline/paths?month=${encodeURIComponent(m)}${kindQs}`);
     return r.paths || [];
   }
   return [];
 }
 
 function applyViewMode() {
-  if (!["journey", "classic", "map"].includes(state.viewMode)) {
+  if (!["journey", "classic", "map", "search"].includes(state.viewMode)) {
     state.viewMode = "journey";
   }
   const journey = $("#journey-root");
   const classic = $("#classic-root");
   const mapRoot = $("#map-root");
+  const searchRoot = $("#search-root");
   document.querySelectorAll('.seg[aria-label="浏览模式"] .seg-btn').forEach((b) => {
     b.classList.toggle("active", b.dataset.view === state.viewMode);
   });
   journey?.classList.add("hidden");
   classic?.classList.add("hidden");
   mapRoot?.classList.add("hidden");
+  searchRoot?.classList.add("hidden");
   const empty = !(state.outlineCache?.years?.length || state.timelineCache?.years?.length);
+  if (state.viewMode === "search") {
+    $("#browse-empty")?.classList.add("hidden");
+    searchRoot?.classList.remove("hidden");
+    setTimeout(() => $("#search-q")?.focus(), 40);
+    updateSelectUI();
+    return;
+  }
   if (empty) {
     // 首屏加载中不闪「空相册」
     $("#browse-empty")?.classList.add("hidden");
@@ -334,7 +461,11 @@ function applyViewMode() {
     if (state.outlineCache) renderJourney(state.outlineCache);
   } else if (state.viewMode === "classic") {
     classic?.classList.remove("hidden");
-    ensureClassicView().catch((e) => console.error(e));
+    // 分类变化时强制重建经典流
+    if (state.classicState) state.classicState.built = false;
+    const root = $("#classic-root");
+    if (root) root.dataset.built = "";
+    ensureClassicView(true).catch((e) => console.error(e));
   } else if (state.viewMode === "map") {
     mapRoot?.classList.remove("hidden");
     loadMap(false).catch((e) => {
@@ -366,6 +497,7 @@ function outlineMonthList(outline) {
   const list = [];
   (outline?.years || []).forEach((y) => {
     (y.months || []).forEach((m) => {
+      if (!monthMatchesKindFilter(m)) return;
       list.push({
         month: m.month,
         photo_count: m.photo_count || 0,
@@ -381,6 +513,7 @@ function appendClassicPhotos(photos, root) {
   let curDay = curSection?.dataset?.day || null;
   let curGrid = curSection?.querySelector(".classic-grid") || null;
 
+  const pendingImgs = [];
   photos.forEach((p) => {
     const day = ((p.meta && p.meta.datetime) || "").slice(0, 10) || "未知日期";
     if (day !== curDay) {
@@ -404,18 +537,28 @@ function appendClassicPhotos(photos, root) {
     const title = (p.meta && p.meta.title) || p.name || "";
     const isVid = p.kind === "video" || isVideoName(p.name);
     btn.title = title;
+    btn.dataset.kind = isVid ? "video" : "image";
+    const thumbSrc = `/api/thumb?path=${encodeURIComponent(p.path)}&size=${albumThumbSize()}&_=${state.thumbBust || 0}`;
     btn.innerHTML = `
-      ${isVid ? `<span class="classic-vid" aria-hidden="true">▶</span>` : ""}
-      <img loading="lazy" decoding="async" alt="${escapeAttr(title)}"
-        src="/api/thumb?path=${encodeURIComponent(p.path)}&size=320&_=${state.thumbBust || 0}" />`;
+      ${
+        isVid
+          ? `<span class="classic-vid" aria-hidden="true">视频</span>`
+          : `<span class="classic-img-badge" aria-hidden="true">照片</span>`
+      }
+      <img class="classic-thumb js-thumb" decoding="async" alt="${escapeAttr(title)}"
+        data-src="${thumbSrc}" />`;
+    if (state.mediaKindFilter === "image" && isVid) btn.classList.add("media-kind-hidden");
+    if (state.mediaKindFilter === "video" && !isVid) btn.classList.add("media-kind-hidden");
     btn.addEventListener("click", () =>
       openLightbox(p.path, state.classicPaths || [], p.meta || null)
     );
+    pendingImgs.push(btn.querySelector("img.classic-thumb"));
     curGrid.appendChild(btn);
     const nEl = curSection.querySelector(".classic-day-n");
     if (nEl) nEl.textContent = `${curGrid.children.length} 张`;
     state.classicPaths.push(p.path);
   });
+  bindClassicThumbLazy(pendingImgs);
 }
 
 async function ensureClassicView(force = false) {
@@ -480,6 +623,7 @@ async function ensureClassicView(force = false) {
       if (totalEl) {
         totalEl.textContent = `已加载 ${state.classicPaths.length} / ${total} 张 · 点击沉浸翻看`;
       }
+      enqueueVisibleThumbs([...root.querySelectorAll("img.classic-thumb.js-thumb")]);
     } catch (e) {
       sentinel.textContent = e.message || String(e);
     } finally {
@@ -495,7 +639,7 @@ async function ensureClassicView(force = false) {
     (entries) => {
       if (entries.some((en) => en.isIntersecting)) loadMore();
     },
-    { root: null, rootMargin: "600px", threshold: 0 }
+    { root: null, rootMargin: "200px", threshold: 0 }
   );
   state._classicObserver.observe(sentinel);
   await loadMore();
@@ -639,7 +783,8 @@ function renderJourney(data) {
   rail.appendChild(head);
 
   (data.years || []).forEach((y) => {
-    const albums = y.month_count || (y.months || []).length;
+    if (!yearMatchesKindFilter(y)) return;
+    const albums = (y.months || []).filter(monthMatchesKindFilter).length || y.month_count || (y.months || []).length;
     const imageCount = y.image_count != null
       ? y.image_count
       : (y.months || []).reduce((n, m) => n + (m.image_count || (m.photos || []).filter((p) => p.kind !== "video").length), 0);
@@ -659,15 +804,21 @@ function renderJourney(data) {
     const node = document.createElement("button");
     node.type = "button";
     node.className = "journey-node";
+    const f = state.mediaKindFilter || "all";
+    const showImg = f !== "video";
+    const showVid = f !== "image";
     const videoStat =
-      videoCount > 0
+      showVid && videoCount > 0
         ? `<span>视频 <strong>${videoCount}</strong> 条</span>`
         : "";
+    const photoStat = showImg
+      ? `<span>照片 <strong>${imageCount}</strong> 张</span>`
+      : "";
     node.innerHTML = `
       <div class="journey-year">${y.year}</div>
       <div class="journey-stats">
         <span>相册 <strong>${albums}</strong> 册</span>
-        <span>照片 <strong>${imageCount}</strong> 张</span>
+        ${photoStat}
         ${videoStat}
       </div>
       <p class="journey-brief">${escapeAttr(brief)}</p>`;
@@ -675,6 +826,7 @@ function renderJourney(data) {
     const albumsBox = document.createElement("div");
     albumsBox.className = "journey-albums";
     (y.months || []).forEach((m) => {
+      if (!monthMatchesKindFilter(m)) return;
       const albumBtn = document.createElement("button");
       albumBtn.type = "button";
       albumBtn.className = "journey-album";
@@ -685,9 +837,15 @@ function renderJourney(data) {
       const mVid = m.video_count != null
         ? m.video_count
         : (m.photos || []).filter((p) => p.kind === "video").length;
-      const mTotal = m.photo_count != null ? m.photo_count : mImg + mVid;
-      const metaBits = [`${mTotal || mImg} 张`];
-      if (mVid) metaBits.push(`${mVid} 条视频`);
+      const mTotal =
+        f === "video" ? mVid : f === "image" ? mImg : (m.photo_count != null ? m.photo_count : mImg + mVid);
+      const metaBits = [];
+      if (f === "video") metaBits.push(`${mVid} 条视频`);
+      else if (f === "image") metaBits.push(`${mImg} 张`);
+      else {
+        metaBits.push(`${mTotal || mImg} 张`);
+        if (mVid) metaBits.push(`${mVid} 条视频`);
+      }
       albumBtn.innerHTML = `
         <span class="journey-album-name">${monthLabel}</span>
         <span class="journey-album-meta">${metaBits.join(" · ")}</span>`;
@@ -724,11 +882,19 @@ function makePhotoCard(p, galleryPaths) {
   card.dataset.path = p.path;
   const title = (p.meta && p.meta.title) || p.name;
   const isVid = p.kind === "video" || isVideoName(p.name);
+  card.dataset.kind = isVid ? "video" : "image";
+  const thumbSrc = `/api/thumb?path=${encodeURIComponent(p.path)}&size=${albumThumbSize()}&_=${state.thumbBust || 0}`;
   card.innerHTML = `
     <span class="photo-check" aria-hidden="true"></span>
-    ${isVid ? `<span class="media-badge" aria-hidden="true">▶</span>` : ""}
-    <img loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(p.path)}&size=320&_=${state.thumbBust || 0}" alt="" />
+    ${
+      isVid
+        ? `<span class="media-badge media-badge-video" aria-hidden="true">视频</span>`
+        : `<span class="media-badge media-badge-image" aria-hidden="true">照片</span>`
+    }
+    <img class="js-thumb" loading="lazy" decoding="async" data-src="${thumbSrc}" alt="" />
     <span>${escapeHtml(title)}</span>`;
+  if (state.mediaKindFilter === "image" && isVid) card.classList.add("media-kind-hidden");
+  if (state.mediaKindFilter === "video" && !isVid) card.classList.add("media-kind-hidden");
   card.addEventListener("click", (e) => {
     if (state.selectMode) {
       e.preventDefault();
@@ -753,7 +919,8 @@ async function fillMonthGrid(monthEl, month, opts = {}) {
     grid.className = "month-body photo-grid";
     monthEl.appendChild(grid);
   }
-  if (grid.dataset.loaded === "1" && !force) return;
+  const kind = mediaKindQuery() || "all";
+  if (grid.dataset.loaded === "1" && grid.dataset.kind === kind && !force) return;
 
   const paths = [];
   let offset = 0;
@@ -770,6 +937,7 @@ async function fillMonthGrid(monthEl, month, opts = {}) {
       paths.push(p.path);
       grid.appendChild(makePhotoCard(p, paths));
     });
+    bindAlbumThumbLazy(grid);
     offset = (page.offset || 0) + photos.length;
     if (page.has_more) {
       const btn = document.createElement("button");
@@ -791,6 +959,7 @@ async function fillMonthGrid(monthEl, month, opts = {}) {
       grid.appendChild(btn);
     } else {
       grid.dataset.loaded = "1";
+      grid.dataset.kind = kind;
     }
     grid.dataset.total = String(page.total || paths.length);
   };
@@ -926,13 +1095,26 @@ async function loadTree(force = false) {
     });
 
     (y.months || []).forEach((m) => {
+      if (!monthMatchesKindFilter(m)) return;
       const monthEl = document.createElement("details");
       monthEl.className = "month";
       monthEl.dataset.scopeKey = `month:${m.month}`;
       monthEl.dataset.month = m.month;
-      const mCount = m.photo_count != null ? m.photo_count : (m.photos || []).length;
+      const f = state.mediaKindFilter || "all";
+      const mImg = m.image_count != null ? m.image_count : 0;
+      const mVid = m.video_count != null ? m.video_count : 0;
+      const mCount =
+        f === "video"
+          ? mVid
+          : f === "image"
+            ? mImg || Math.max(0, (m.photo_count || 0) - mVid)
+            : m.photo_count != null
+              ? m.photo_count
+              : (m.photos || []).length;
       const monthSummary = document.createElement("summary");
-      monthSummary.innerHTML = `<span>${m.month}<span class="muted"> · ${mCount} 张</span></span>`;
+      monthSummary.innerHTML = `<span>${m.month}<span class="muted"> · ${mCount} ${
+        f === "video" ? "条" : "张"
+      }</span></span>`;
       monthSummary.appendChild(buildMonthSelectBar(`month:${m.month}`));
       monthEl.appendChild(monthSummary);
       const grid = document.createElement("div");
@@ -1235,9 +1417,9 @@ async function openMapExpand(cluster) {
     btn.type = "button";
     btn.className = "map-expand-item";
     const t = (p.meta && p.meta.title) || p.name;
-    btn.innerHTML = `<img loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(
+    btn.innerHTML = `<img class="js-thumb" loading="lazy" decoding="async" data-src="/api/thumb?path=${encodeURIComponent(
       p.path
-    )}&size=320&_=${state.thumbBust || 0}" alt="" /><span>${escapeAttr(t)}</span>`;
+    )}&size=${albumThumbSize()}&_=${state.thumbBust || 0}" alt="" /><span>${escapeAttr(t)}</span>`;
     btn.addEventListener("click", () =>
       openLightbox(
         p.path,
@@ -1247,6 +1429,7 @@ async function openMapExpand(cluster) {
     );
     grid.appendChild(btn);
   });
+  bindAlbumThumbLazy(grid);
 }
 
 function closeMapExpand() {
@@ -1301,7 +1484,8 @@ async function refreshMapClusters() {
   const q =
     `zoom=${encodeURIComponent(z)}` +
     `&west=${b.getWest()}&south=${b.getSouth()}` +
-    `&east=${b.getEast()}&north=${b.getNorth()}&limit=800`;
+    `&east=${b.getEast()}&north=${b.getNorth()}&limit=800` +
+    (mediaKindQuery() ? `&kind=${encodeURIComponent(mediaKindQuery())}` : "");
   const data = await api(`/api/map/clusters?${q}`);
   state._lastClusterZoom = z;
   await paintMapClusters(data.clusters || []);
@@ -1372,71 +1556,589 @@ function invalidateMapData() {
 }
 
 /* Import */
-function renderImportItems(items) {
-  const list = $("#import-list");
-  const empty = $("#import-empty");
-  list.innerHTML = "";
-  $("#import-count").textContent = items.length ? `共 ${items.length} 项` : "";
-  if (!items.length) {
-    empty.classList.remove("hidden");
-    return;
-  }
-  empty.classList.add("hidden");
-
-  items.forEach((it) => {
-    const row = document.createElement("div");
-    row.className = "import-item";
-    row.dataset.path = it.path;
-    if (it.live_companion) row.dataset.liveCompanion = "1";
-    const meta = it.meta || {};
-    const kind = it.kind || (isVideoName(it.name) ? "video" : "image");
-    const heic = isHeicName(it.name || it.path);
-    const mobile = isMobileClient();
-    let preview;
-    if (kind === "video") {
-      preview = it.live_companion
-        ? `<div class="import-video-ph" title="实况伴生视频">Live</div>`
-        : `<div class="import-video-ph" title="视频">▶</div>`;
-    } else if (mobile) {
-      // 手机列表先不生成 HEIC/大图预览（树莓派解码很慢），入库不受影响
-      preview = heic
-        ? `<div class="import-video-ph" title="HEIC 原件">HEIC</div>`
-        : `<div class="import-video-ph" title="图片">图</div>`;
-    } else if (heic) {
-      preview = `<img loading="lazy" decoding="async" src="/api/preview?source=import&path=${encodeURIComponent(it.path)}&size=240" alt="" />`;
-    } else {
-      // 切勿用 /api/file 原图：数百项会把树莓派打满
-      preview = `<img loading="lazy" decoding="async" src="/api/preview?source=import&path=${encodeURIComponent(it.path)}&size=240" alt="" />`;
+const importPreviewLoader = {
+  max: 2,
+  active: 0,
+  queue: [],
+  paused: false,
+  enqueue(img) {
+    this.queue.push(img);
+    this.pump();
+  },
+  pause() {
+    this.paused = true;
+  },
+  resume() {
+    this.paused = false;
+    this.pump();
+  },
+  pump() {
+    while (!this.paused && this.active < this.max && this.queue.length) {
+      const img = this.queue.shift();
+      if (!img || !img.isConnected) continue;
+      const src = img.dataset.src;
+      if (!src || img.dataset.loaded === "1") continue;
+      this.active += 1;
+      img.dataset.loading = "1";
+      const tryLoad = (attempt) => {
+        const url = attempt > 0 ? `${src}${src.includes("?") ? "&" : "?"}r=${attempt}` : src;
+        img.onload = () => {
+          img.dataset.loaded = "1";
+          img.dataset.loading = "";
+          img.classList.add("is-ready");
+          this.active = Math.max(0, this.active - 1);
+          this.pump();
+        };
+        img.onerror = () => {
+          if (attempt < 1) {
+            tryLoad(attempt + 1);
+            return;
+          }
+          img.dataset.loading = "";
+          img.classList.add("is-broken");
+          img.removeAttribute("src");
+          img.alt = "预览失败";
+          this.active = Math.max(0, this.active - 1);
+          this.pump();
+        };
+        img.src = url;
+      };
+      tryLoad(0);
     }
-    const badge = it.live_companion
-      ? `<span class="live-badge">实况伴生 · 随同名 HEIC 入库</span>`
-      : heic
-        ? `<span class="live-badge heic">HEIC 原件</span>`
-        : "";
-    // 实况伴生 MOV 默认不单独勾选（会随 HEIC 一起带走）
-    const checked = it.live_companion ? "" : "checked";
-    row.innerHTML = `
-      <input type="checkbox" class="pick" ${checked} />
-      ${preview}
-      <div class="import-fields">
-        <label>文件 <input type="text" value="${escapeAttr(it.name)}" disabled /></label>
-        ${badge}
-        <label>时间 <input type="datetime-local" class="f-datetime" value="${toLocalInput(meta.datetime)}" ${it.live_companion ? "disabled" : ""} /></label>
-        <label>简述 <input type="text" class="f-title" maxlength="30" value="${escapeAttr(meta.title || "")}" ${it.live_companion ? "disabled" : ""} /></label>
-        <label>描述 <input type="text" class="f-description" value="${escapeAttr(meta.description || "")}" ${it.live_companion ? "disabled" : ""} /></label>
-        <label>地点 <input type="text" class="f-location" value="${escapeAttr(meta.location || "")}" ${it.live_companion ? "disabled" : ""} /></label>
-      </div>`;
-    list.appendChild(row);
+  },
+  reset() {
+    this.queue = [];
+    this.active = 0;
+    this.paused = false;
+  },
+};
+
+/** 全局缩略图并发队列：经典 / 时光 / 地图共用，避免打满树莓派 */
+const albumThumbLoader = {
+  max: 4,
+  active: 0,
+  queue: [],
+  enqueue(img) {
+    this.queue.push(img);
+    this.pump();
+  },
+  pump() {
+    while (this.active < this.max && this.queue.length) {
+      const img = this.queue.shift();
+      if (!img || !img.isConnected) continue;
+      const src = img.dataset.src;
+      if (!src || img.dataset.loaded === "1") continue;
+      this.active += 1;
+      img.onload = () => {
+        img.dataset.loaded = "1";
+        img.classList.add("is-ready");
+        this.active = Math.max(0, this.active - 1);
+        this.pump();
+      };
+      img.onerror = () => {
+        img.classList.add("is-broken");
+        this.active = Math.max(0, this.active - 1);
+        this.pump();
+      };
+      img.src = src;
+    }
+  },
+};
+
+function albumThumbIO() {
+  if (state._albumThumbIO) return state._albumThumbIO;
+  state._albumThumbIO = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        state._albumThumbIO.unobserve(entry.target);
+        albumThumbLoader.enqueue(entry.target);
+      }
+    },
+    { root: null, rootMargin: "280px 0px", threshold: 0 }
+  );
+  return state._albumThumbIO;
+}
+
+function enqueueVisibleThumbs(list) {
+  const h = window.innerHeight || 800;
+  list.forEach((img) => {
+    if (!img?.isConnected || img.dataset.loaded === "1" || img.dataset.loading === "1") return;
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    if (rect.bottom >= -280 && rect.top <= h + 280) albumThumbLoader.enqueue(img);
   });
 }
 
-async function loadImport() {
+function bindAlbumThumbLazy(imgsOrRoot) {
+  const list = Array.isArray(imgsOrRoot)
+    ? imgsOrRoot.filter(Boolean)
+    : [...(imgsOrRoot?.querySelectorAll?.("img[data-src].js-thumb") || [])];
+  if (!list.length) return;
+  if (!("IntersectionObserver" in window)) {
+    list.forEach((img) => albumThumbLoader.enqueue(img));
+    return;
+  }
+  const io = albumThumbIO();
+  list.forEach((img) => io.observe(img));
+  // Chrome：局部 IO 易被回收；切到经典模式时首屏也可能还没 layout 完
+  requestAnimationFrame(() => enqueueVisibleThumbs(list));
+  setTimeout(() => enqueueVisibleThumbs(list), 120);
+}
+
+/** @deprecated 兼容旧名 */
+const classicThumbLoader = albumThumbLoader;
+function bindClassicThumbLazy(imgs) {
+  bindAlbumThumbLazy(imgs);
+}
+
+function bindImportPreviewLazy(list) {
+  const imgs = [...list.querySelectorAll("img.import-preview[data-src]")];
+  if (!imgs.length) return;
+  if (!("IntersectionObserver" in window)) {
+    imgs.forEach((img) => importPreviewLoader.enqueue(img));
+    return;
+  }
+  if (!state._importThumbIO) {
+    state._importThumbIO = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          state._importThumbIO.unobserve(entry.target);
+          importPreviewLoader.enqueue(entry.target);
+        }
+      },
+      { root: null, rootMargin: "280px 0px", threshold: 0 }
+    );
+  }
+  imgs.forEach((img) => state._importThumbIO.observe(img));
+  requestAnimationFrame(() => {
+    const h = window.innerHeight || 800;
+    imgs.forEach((img) => {
+      if (!img.isConnected || img.dataset.loaded === "1") return;
+      const rect = img.getBoundingClientRect();
+      if (rect.bottom >= -40 && rect.top <= h + 280) importPreviewLoader.enqueue(img);
+    });
+  });
+}
+
+/** 批量编辑时列表可能被卸下 DOM，统一从这里取根节点 */
+function importListRoot() {
+  return state._detachedImportList || ensureImportListEl();
+}
+
+function ensureImportExtraFields(row) {
+  if (!row || row.querySelector(".f-description")) return;
+  const fields = row.querySelector(".import-fields");
+  if (!fields || row.dataset.liveCompanion === "1") return;
+  const desc = row.dataset.description || "";
+  const loc = row.dataset.location || "";
+  const extra = document.createElement("div");
+  extra.className = "import-extra-fields";
+  extra.innerHTML = `
+    <label>描述 <input type="text" class="f-description" value="${escapeAttr(desc)}" /></label>
+    <label>地点 <input type="text" class="f-location" value="${escapeAttr(loc)}" /></label>`;
+  fields.appendChild(extra);
+}
+
+function setImportRowField(row, key, value) {
+  if (!row) return;
+  const text = value == null ? "" : String(value);
+  if (key === "datetime") {
+    const el = row.querySelector(".f-datetime");
+    if (el) el.value = text;
+    row.dataset.datetime = text;
+    return;
+  }
+  if (key === "title") {
+    const el = row.querySelector(".f-title");
+    if (el) el.value = text;
+    row.dataset.title = text;
+    return;
+  }
+  if (key === "description" || key === "location") {
+    row.dataset[key] = text;
+    ensureImportExtraFields(row);
+    const el = row.querySelector(key === "description" ? ".f-description" : ".f-location");
+    if (el) el.value = text;
+  }
+}
+
+function wireImportRow(row, list) {
+  const pick = row.querySelector(".pick");
+  pick?.addEventListener("change", () => {
+    if (pick.checked) ensureImportExtraFields(row);
+    const all = $("#check-all");
+    const root = list || importListRoot();
+    if (all && root) {
+      const picks = [...root.querySelectorAll(".import-item .pick:not(:disabled)")];
+      all.checked = picks.length > 0 && picks.every((x) => x.checked);
+    }
+    updateImportSelectionCount();
+  });
+  // 缩略图点击：预览大图 / 播放视频（不再用来勾选）
+  row.querySelector(".import-thumb")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (row.dataset.liveCompanion === "1") return;
+    openImportMediaPreview(
+      row.dataset.path,
+      row.dataset.kind || "image",
+      row.querySelector(".import-file-name")?.textContent || "",
+      row
+    );
+  });
+}
+
+function rememberImportPreviewSpot(row) {
+  const list = importListRoot();
+  state._importPreviewRestore = {
+    path: row?.dataset?.path || "",
+    row,
+    thumb: row?.querySelector(".import-preview-btn") || row?.querySelector(".import-thumb"),
+    y: window.scrollY,
+    listTop: list && list.scrollHeight > list.clientHeight ? list.scrollTop : null,
+  };
+}
+
+function restoreImportPreviewSpot() {
+  const r = state._importPreviewRestore;
+  if (!r) return;
+  const apply = () => {
+    if (r.listTop != null) {
+      const list = importListRoot();
+      if (list) list.scrollTop = r.listTop;
+    }
+    window.scrollTo(0, r.y);
+    const row =
+      (r.row && r.row.isConnected && r.row) ||
+      (r.path && importListRoot()?.querySelector(`.import-item[data-path="${CSS.escape(r.path)}"]`));
+    const el = row?.querySelector(".import-preview-btn") || row?.querySelector(".import-thumb") || r.thumb;
+    if (el?.focus) el.focus({ preventScroll: true });
+    row?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  };
+  apply();
+  requestAnimationFrame(() => {
+    apply();
+    setTimeout(apply, 0);
+  });
+}
+
+async function openImportMediaPreview(path, kind, name, row = null) {
+  if (!path) return;
+  rememberImportPreviewSpot(
+    row || importListRoot()?.querySelector(`.import-item[data-path="${CSS.escape(path)}"]`)
+  );
+  const opener = state._importPreviewRestore?.thumb;
+  if (opener?.focus) opener.focus({ preventScroll: true });
+  let dlg = $("#import-media-dlg");
+  if (!dlg) {
+    dlg = document.createElement("dialog");
+    dlg.id = "import-media-dlg";
+    dlg.className = "import-media-dlg";
+    dlg.innerHTML = `
+      <div class="import-media-head">
+        <strong id="import-media-title">预览</strong>
+        <button type="button" class="btn ghost" id="import-media-close" aria-label="关闭">关闭</button>
+      </div>
+      <div class="import-media-body" id="import-media-body"></div>`;
+    document.body.appendChild(dlg);
+    dlg.querySelector("#import-media-close")?.addEventListener("click", () => closeImportMediaPreview());
+    dlg.addEventListener("click", (ev) => {
+      if (ev.target === dlg) closeImportMediaPreview();
+    });
+    dlg.addEventListener("close", () => {
+      const body = $("#import-media-body");
+      if (body) body.innerHTML = "";
+      restoreImportPreviewSpot();
+    });
+  }
+  const title = $("#import-media-title");
+  const body = $("#import-media-body");
+  if (title) title.textContent = name || path.split("/").pop() || "预览";
+  if (!body) return;
+  body.innerHTML = "";
+  const isVid = kind === "video" || isVideoName(path);
+  if (isVid) {
+    const tip = document.createElement("p");
+    tip.className = "import-media-tip";
+    tip.textContent = "正在准备播放…";
+    body.appendChild(tip);
+    const video = document.createElement("video");
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = "metadata";
+    body.appendChild(video);
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else dlg.setAttribute("open", "open");
+    const ok = await bindLightboxVideo(video, path, "import");
+    tip.remove();
+    if (!ok) {
+      const err = document.createElement("p");
+      err.className = "import-media-tip";
+      err.textContent = "无法播放该视频（格式不兼容、损坏或未传完）";
+      body.appendChild(err);
+    } else {
+      video.play?.().catch(() => {});
+    }
+    return;
+  }
+  const img = document.createElement("img");
+  img.alt = name || "";
+  img.src = `/api/preview?source=import&path=${encodeURIComponent(path)}&size=${lightboxPreviewSize()}`;
+  img.onerror = () => {
+    img.src = `/api/file?source=import&path=${encodeURIComponent(path)}`;
+  };
+  body.appendChild(img);
+  if (typeof dlg.showModal === "function") dlg.showModal();
+  else dlg.setAttribute("open", "open");
+}
+
+function closeImportMediaPreview() {
+  const dlg = $("#import-media-dlg");
+  if (!dlg) return;
+  const video = dlg.querySelector("video");
+  if (video) {
+    try {
+      video.pause();
+    } catch (_) {}
+  }
+  if (typeof dlg.close === "function") dlg.close();
+  else dlg.removeAttribute("open");
+  const body = $("#import-media-body");
+  if (body) body.innerHTML = "";
+}
+
+function buildImportRow(it) {
+  const row = document.createElement("div");
+  row.className = "import-item";
+  row.dataset.path = it.path;
+  if (it.live_companion) row.dataset.liveCompanion = "1";
+  if (it.content_hash) row.dataset.contentHash = it.content_hash;
+  if (it.duplicate) row.dataset.duplicate = "1";
+  if (it.inbox_duplicate) row.dataset.inboxDuplicate = "1";
+  if (it.duplicate || it.inbox_duplicate) row.classList.add("is-duplicate");
+  const meta = it.meta || {};
+  row.dataset.datetime = toLocalInput(meta.datetime);
+  row.dataset.title = meta.title || "";
+  row.dataset.description = meta.description || "";
+  row.dataset.location = meta.location || "";
+  const kind = it.kind || (isVideoName(it.name) ? "video" : "image");
+  row.dataset.kind = kind;
+  const heic = isHeicName(it.name || it.path);
+  let preview;
+  if (it.live_companion) {
+    preview = `<div class="import-thumb import-video-ph" title="实况伴生视频">Live</div>`;
+  } else if (kind === "video" && isMobileClient()) {
+    preview = `<button type="button" class="import-thumb import-video-ph import-preview-btn" title="点击播放">▶</button>`;
+  } else {
+    const src = `/api/preview?source=import&path=${encodeURIComponent(it.path)}&size=${isMobileClient() ? 120 : 160}`;
+    const badge = kind === "video" ? `<span class="import-thumb-play" aria-hidden="true">▶</span>` : "";
+    const tip = kind === "video" ? "点击播放" : "点击看大图";
+    preview = `<button type="button" class="import-thumb import-preview-btn" title="${tip}">
+      <img class="import-preview" loading="lazy" decoding="async" data-src="${src}" alt="" />
+      ${badge}
+    </button>`;
+  }
+  let badge = it.live_companion
+    ? `<span class="live-badge">实况伴生 · 随同名 HEIC 入库</span>`
+    : heic
+      ? `<span class="live-badge heic">HEIC 原件</span>`
+      : kind === "video"
+        ? `<span class="live-badge">视频</span>`
+        : "";
+  if (it.duplicate) {
+    const of = (it.duplicate_of && it.duplicate_of[0]) || "";
+    badge += `<span class="dup-badge" title="${escapeAttr(of)}">相册已有相同内容</span>`;
+  } else if (it.inbox_duplicate) {
+    badge += `<span class="dup-badge inbox">待入库内重复</span>`;
+  }
+  const liveDis = it.live_companion ? "disabled" : "";
+  row.innerHTML = `
+    <label class="import-pick" title="选中入库">
+      <input type="checkbox" class="pick" ${liveDis} />
+    </label>
+    ${preview}
+    <div class="import-fields">
+      <div class="import-file-name" title="${escapeAttr(it.name)}">${escapeAttr(it.name)}</div>
+      ${badge}
+      <label>时间 <input type="datetime-local" class="f-datetime" value="${escapeAttr(row.dataset.datetime)}" ${liveDis} /></label>
+      <label>简述 <input type="text" class="f-title" maxlength="30" value="${escapeAttr(row.dataset.title)}" ${liveDis} /></label>
+    </div>`;
+  return row;
+}
+
+/** 确保 #import-list 在 DOM 中（批量编辑曾会卸下列表，导致后续按钮全挂） */
+function ensureImportListEl() {
+  let list = document.getElementById("import-list");
+  if (list && list.isConnected) return list;
+
+  // 优先把卸下的列表挂回去
+  const ph = document.getElementById("import-list-ph");
+  if (state._detachedImportList) {
+    const node = state._detachedImportList;
+    state._detachedImportList = null;
+    state._importListParent = null;
+    document.body.classList.remove("is-batch-open");
+    if (ph && ph.parentNode) {
+      ph.replaceWith(node);
+      return node;
+    }
+    // 占位符已丢：插回进度条后面
+    const progress = document.getElementById("ingest-progress");
+    if (progress?.parentNode) {
+      progress.after(node);
+      return node;
+    }
+  }
+
+  // 仅剩占位符：换成空列表
+  if (ph && ph.parentNode) {
+    list = document.createElement("div");
+    list.id = "import-list";
+    list.className = "import-list";
+    ph.replaceWith(list);
+    document.body.classList.remove("is-batch-open");
+    return list;
+  }
+
+  // 最后兜底：在入库面板末尾重建
+  const pane = document.getElementById("manage-import");
+  list = document.createElement("div");
+  list.id = "import-list";
+  list.className = "import-list";
+  if (pane) pane.appendChild(list);
+  document.body.classList.remove("is-batch-open");
+  return list;
+}
+
+function renderImportItems(items) {
+  document.body.classList.remove("is-batch-open");
+  const list = ensureImportListEl();
   const empty = $("#import-empty");
-  const list = $("#import-list");
+  importPreviewLoader.reset();
+  if (!list) return;
+  list.innerHTML = "";
+  state.importItemCount = items.length;
+  const countEl = $("#import-count");
+  if (countEl) countEl.textContent = items.length ? `共 ${items.length} 项` : "";
+  if (!items.length) {
+    empty?.classList.remove("hidden");
+    return;
+  }
+  empty?.classList.add("hidden");
+
+  const frag = document.createDocumentFragment();
+  const rows = [];
+  for (const it of items) {
+    const row = buildImportRow(it);
+    rows.push(row);
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+  for (const row of rows) wireImportRow(row, list);
+  const all = $("#check-all");
+  if (all) all.checked = false;
+  updateImportSelectionCount();
+  bindImportPreviewLazy(list);
+}
+
+
+function collectIngestItems() {
+  const items = [];
+  const root = importListRoot();
+  if (!root) return items;
+  root.querySelectorAll(".import-item").forEach((row) => {
+    const pick = row.querySelector(".pick");
+    if (!pick || !pick.checked || pick.disabled) return;
+    if (row.dataset.liveCompanion === "1") return;
+    items.push({
+      path: row.dataset.path,
+      name: row.querySelector(".import-file-name")?.textContent || row.dataset.path,
+      datetime: fromLocalInput(row.querySelector(".f-datetime")?.value || row.dataset.datetime || ""),
+      title: row.querySelector(".f-title")?.value || row.dataset.title || "",
+      description: row.querySelector(".f-description")?.value || row.dataset.description || "",
+      location: row.querySelector(".f-location")?.value || row.dataset.location || "",
+      content_hash: row.dataset.contentHash || null,
+      row,
+    });
+  });
+  return items;
+}
+
+function updateImportSelectionCount() {
+  const el = $("#import-count");
+  if (!el) return;
+  const root = importListRoot();
+  const total = state.importItemCount || root?.querySelectorAll(".import-item").length || 0;
+  const selected = collectIngestItems().length;
+  const dupN = root?.querySelectorAll(".import-item.is-duplicate").length || 0;
+  if (!total) {
+    el.textContent = "";
+    return;
+  }
+  el.textContent =
+    `已选 ${selected} / 共 ${total} 项（仅勾选项会入库）` +
+    (dupN ? ` · 重复 ${dupN}` : "");
+}
+
+const ingestState = {
+  running: false,
+  cancel: false,
+  startedAt: 0,
+};
+
+function setIngestProgress({ show, title, summary, detail, percent }) {
+  const box = $("#ingest-progress");
+  const bar = $("#ingest-progress-bar");
+  if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (title != null && $("#ingest-progress-title")) $("#ingest-progress-title").textContent = title;
+  if (summary != null && $("#ingest-progress-summary")) $("#ingest-progress-summary").textContent = summary;
+  if (detail != null && $("#ingest-progress-detail")) $("#ingest-progress-detail").textContent = detail;
+  if (bar && percent != null) bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+}
+
+/** 进入入库页 / 异常恢复：关掉卡住的弹层，恢复列表与按钮 */
+function resetImportUiState() {
+  try {
+    const batch = $("#batch-dialog");
+    if (batch?.open) batch.close();
+  } catch (_) {}
+  try {
+    closeImportMediaPreview();
+  } catch (_) {}
+  // 强制恢复被卸下的列表（即使 state 丢了也要清掉占位符）
+  ensureImportListEl();
+  document.body.classList.remove("is-batch-open");
+  importPreviewLoader.resume?.();
+  if (ingestState.running) {
+    const stuckMs = Date.now() - (ingestState.startedAt || 0);
+    if (stuckMs > 180000 || !ingestState.startedAt) {
+      ingestState.running = false;
+      ingestState.cancel = false;
+      ingestState.startedAt = 0;
+    }
+  }
+  const btn = $("#btn-ingest");
+  const btnCancel = $("#btn-ingest-cancel");
+  if (!ingestState.running) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "入库选中项";
+    }
+    if (btnCancel) btnCancel.classList.add("hidden");
+  }
+}
+
+async function loadImport() {
+  ensureImportListEl();
+  const empty = $("#import-empty");
+  const list = ensureImportListEl();
   if (list && !list.children.length) {
     if (empty) {
       empty.classList.remove("hidden");
-      empty.textContent = "正在读取并解析元数据…";
+      empty.textContent = "正在读取待入库列表…";
     }
   }
   const data = await api("/api/import/list");
@@ -1444,42 +2146,239 @@ async function loadImport() {
   renderImportItems(data.items || []);
 }
 
-$("#btn-reload-import").addEventListener("click", () => loadImport().catch(alert));
-$("#btn-parse").addEventListener("click", async () => {
-  try {
-    const data = await api("/api/import/parse", { method: "POST", body: "{}" });
-    renderImportItems(data.items);
-  } catch (e) {
-    alert(e.message);
-  }
-});
-
-$("#check-all").addEventListener("change", (e) => {
-  document.querySelectorAll(".import-item .pick").forEach((c) => {
-    c.checked = e.target.checked;
-  });
-});
-
-$("#btn-select-same-day").addEventListener("click", () => {
-  const rows = [...document.querySelectorAll(".import-item")];
-  const checked = rows.filter((r) => r.querySelector(".pick").checked);
+function selectSameDayImport() {
+  const root = importListRoot();
+  const rows = [...(root?.querySelectorAll(".import-item") || [])];
+  const checked = rows.filter((r) => r.querySelector(".pick")?.checked);
   if (!checked.length) {
     alert("请先勾选一张作为「同日」参考");
     return;
   }
-  const ref = checked[0].querySelector(".f-datetime").value.slice(0, 10);
+  const ref = (checked[0].querySelector(".f-datetime")?.value || "").slice(0, 10);
   if (!ref) {
     alert("参考项没有日期，请先填写时间或换一张");
     return;
   }
   rows.forEach((row) => {
-    const day = (row.querySelector(".f-datetime").value || "").slice(0, 10);
-    row.querySelector(".pick").checked = day === ref;
+    const day = (row.querySelector(".f-datetime")?.value || "").slice(0, 10);
+    const pick = row.querySelector(".pick");
+    if (!pick || pick.disabled) return;
+    pick.checked = day === ref;
+    if (pick.checked) ensureImportExtraFields(row);
   });
-  $("#import-count").textContent = `已勾选同日 ${ref} 的照片`;
-});
+  updateImportSelectionCount();
+  const n = collectIngestItems().length;
+  $("#drop-status").textContent = `已勾选同日 ${ref} 的照片（${n} 项）`;
+}
+
+async function parseImportList(opts = {}) {
+  const CHUNK = 40;
+  const onlyPaths = Array.isArray(opts.paths)
+    ? [...new Set(opts.paths.filter(Boolean))]
+    : null;
+  try {
+    if ($("#drop-status")) $("#drop-status").textContent = "正在解析元数据并比对相册指纹… 0%";
+    // 先拿轻量列表，解析过程中逐步回填，避免长时间无反馈
+    const base = await api("/api/import/list").catch(() => ({ items: [] }));
+    let merged = Array.isArray(base.items) ? base.items.slice() : [];
+    const byPath = new Map(merged.map((it) => [it.path, it]));
+    renderImportItems(merged);
+
+    let offset = 0;
+    let total = onlyPaths ? onlyPaths.length : merged.length || 0;
+    let albumN = 0;
+    let inboxN = 0;
+    let guard = 0;
+    while (guard++ < 500) {
+      const body = { offset, limit: CHUNK };
+      if (onlyPaths) body.paths = onlyPaths;
+      const data = await api("/api/import/parse", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      total = Number(data.total || total || 0);
+      const chunk = data.items || [];
+      for (const it of chunk) {
+        if (byPath.has(it.path)) {
+          Object.assign(byPath.get(it.path), it);
+        } else {
+          byPath.set(it.path, it);
+          merged.push(it);
+        }
+      }
+      // 分片内的待入库重复只覆盖本片；全部结束后用 content_hash 再统一标一次
+      albumN += Number(data.duplicate_album || 0);
+      inboxN += Number(data.duplicate_inbox || 0);
+      const processed = Number(data.processed || offset + chunk.length);
+      const pct = total ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+      if ($("#drop-status")) {
+        $("#drop-status").textContent =
+          data.message || `正在解析… ${processed}/${total}（${pct}%）`;
+      }
+      // 每片回填 UI，让用户看到进度而不是卡住
+      renderImportItems(merged);
+      offset = processed;
+      if (data.done || !chunk.length || processed >= total) break;
+      await new Promise((r) => requestAnimationFrame(() => r()));
+    }
+
+    // 跨分片待入库内重复
+    const hashPeers = new Map();
+    for (const it of merged) {
+      const h = (it.content_hash || "").toLowerCase();
+      if (!h) continue;
+      if (!hashPeers.has(h)) hashPeers.set(h, []);
+      hashPeers.get(h).push(it.path);
+    }
+    inboxN = 0;
+    albumN = 0;
+    for (const it of merged) {
+      const h = (it.content_hash || "").toLowerCase();
+      const peers = h ? (hashPeers.get(h) || []).filter((p) => p !== it.path) : [];
+      it.inbox_duplicate = peers.length > 0;
+      it.inbox_duplicate_of = peers;
+      if (it.duplicate) albumN += 1;
+      else if (it.inbox_duplicate) inboxN += 1;
+    }
+    renderImportItems(merged);
+    const msg =
+      albumN || inboxN
+        ? `解析完成：相册重复 ${albumN} · 待入库内重复 ${inboxN}`
+        : "解析完成：未发现重复";
+    if ($("#drop-status")) $("#drop-status").textContent = msg;
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function discardSelectedImport() {
+  const paths = selectedImportPaths();
+  if (!paths.length) {
+    const msg = "请先勾选要移除的项目（仅从待入库删除，不会进相册）";
+    if ($("#drop-status")) $("#drop-status").textContent = msg;
+    await askConfirm(msg);
+    return;
+  }
+  const ok = await askConfirm(
+    `确定从待入库移除 ${paths.length} 项？\n文件会从导入区删除，不会写入相册。`
+  );
+  if (!ok) return;
+  const r = await api("/api/import/discard", {
+    method: "POST",
+    body: JSON.stringify({ paths }),
+  });
+  $("#drop-status").textContent = `已移除 ${r.removed || 0} 项`;
+  await loadImport();
+}
+
+async function clearAllImport() {
+  const n = state.importItemCount || importListRoot()?.querySelectorAll(".import-item").length || 0;
+  if (!n) {
+    const msg = "待入库列表已空";
+    if ($("#drop-status")) $("#drop-status").textContent = msg;
+    await askConfirm(msg);
+    return;
+  }
+  const ok = await askConfirm(
+    `确定清空全部待入库（约 ${n} 项）？\n文件会从导入区删除，不会写入相册。`
+  );
+  if (!ok) return;
+  const r = await api("/api/import/discard", {
+    method: "POST",
+    body: JSON.stringify({ clear_all: true }),
+  });
+  $("#drop-status").textContent = `已清空待入库（移除 ${r.removed || 0} 项）`;
+  await loadImport();
+}
+
+function bindImportToolbarOnce() {
+  if (window.__xiaoshuImportToolbarBound) return;
+  window.__xiaoshuImportToolbarBound = true;
+
+  const onErr = (err) => {
+    console.error(err);
+    const msg = err?.message || String(err);
+    if ($("#drop-status")) $("#drop-status").textContent = msg;
+    askConfirm(msg).catch(() => {});
+  };
+
+  $("#btn-reload-import")?.addEventListener("click", () => {
+    ensureImportListEl();
+    if ($("#drop-status")) $("#drop-status").textContent = "正在刷新待入库列表…";
+    loadImport().catch(onErr);
+  });
+  $("#btn-parse")?.addEventListener("click", () => {
+    ensureImportListEl();
+    if ($("#drop-status")) $("#drop-status").textContent = "正在重新解析元数据…";
+    parseImportList().catch(onErr);
+  });
+  $("#btn-select-same-day")?.addEventListener("click", () => {
+    ensureImportListEl();
+    selectSameDayImport();
+  });
+  $("#btn-batch-import")?.addEventListener("click", () => {
+    ensureImportListEl();
+    const n = collectIngestItems().length;
+    if (!n) {
+      alert("请先勾选要批量编辑的照片");
+      return;
+    }
+    openBatchDialog("import", n);
+  });
+  $("#btn-discard-import")?.addEventListener("click", () => {
+    ensureImportListEl();
+    discardSelectedImport().catch(onErr);
+  });
+  $("#btn-clear-import")?.addEventListener("click", () => {
+    ensureImportListEl();
+    clearAllImport().catch(onErr);
+  });
+  $("#btn-ingest")?.addEventListener("click", () => {
+    if ($("#btn-ingest")?.disabled) return;
+    ensureImportListEl();
+    runIngestSelected().catch(onErr);
+  });
+  $("#btn-ingest-cancel")?.addEventListener("click", () => {
+    if (!ingestState.running) return;
+    ingestState.cancel = true;
+    $("#drop-status").textContent = "正在停止（完成当前项后结束）…";
+    setIngestProgress({
+      show: true,
+      title: "正在停止…",
+      summary: $("#ingest-progress-summary")?.textContent || "",
+      detail: "将在当前文件处理完后停止",
+      percent: null,
+    });
+  });
+
+  $("#check-all")?.addEventListener("change", (e) => {
+    const root = importListRoot();
+    root?.querySelectorAll(".import-item .pick").forEach((c) => {
+      if (c.disabled) return;
+      c.checked = e.target.checked;
+      if (c.checked) ensureImportExtraFields(c.closest(".import-item"));
+    });
+    updateImportSelectionCount();
+  });
+}
+bindImportToolbarOnce();
 
 /* Batch edit */
+function setBatchUiFrozen(on) {
+  // 不再把 #import-list 从 DOM 卸下（会导致刷新/解析/勾选等同款全部失效）
+  // 仅暂停缩略图队列，减轻弹窗时 CPU
+  if (on) {
+    importPreviewLoader.pause();
+    importPreviewLoader.queue = [];
+    document.body.classList.add("is-batch-open");
+  } else {
+    document.body.classList.remove("is-batch-open");
+    // 清理历史占位符（上一版遗留）
+    ensureImportListEl();
+    importPreviewLoader.resume();
+  }
+}
+
 function openBatchDialog(target, count) {
   state.batchTarget = target;
   $("#batch-title").textContent = `批量编辑（${count} 张）`;
@@ -1494,7 +2393,13 @@ function openBatchDialog(target, count) {
   $("#b-title").value = "";
   $("#b-description").value = "";
   $("#b-location").value = "";
-  $("#batch-dialog").showModal();
+  setBatchDialogBusy(false);
+  setBatchProgress({ show: false, percent: 0, detail: "" });
+  if (target === "import") setBatchUiFrozen(true);
+  else importPreviewLoader.pause();
+  requestAnimationFrame(() => {
+    $("#batch-dialog").showModal();
+  });
 }
 
 function collectBatchFields() {
@@ -1519,18 +2424,63 @@ function collectBatchFields() {
   return { fields, flags };
 }
 
-$("#btn-batch-import").addEventListener("click", () => {
-  const n = document.querySelectorAll(".import-item .pick:checked").length;
-  if (!n) {
-    alert("请先勾选要批量编辑的照片");
-    return;
-  }
-  openBatchDialog("import", n);
+$("#btn-batch-cancel")?.addEventListener("click", () => {
+  $("#batch-dialog")?.close();
 });
 
-$("#btn-batch-cancel").addEventListener("click", () => $("#batch-dialog").close());
+$("#batch-dialog")?.addEventListener("close", () => {
+  setBatchUiFrozen(false);
+  setBatchDialogBusy(false);
+  setBatchProgress({ show: false });
+  importPreviewLoader.resume?.();
+});
 
-$("#btn-batch-apply").addEventListener("click", async () => {
+// 点到输入框就自动勾选对应字段，避免还要点左边小勾
+[
+  ["#b-datetime", "#b-apply-datetime"],
+  ["#b-title", "#b-apply-title"],
+  ["#b-description", "#b-apply-description"],
+  ["#b-location", "#b-apply-location"],
+].forEach(([fieldSel, applySel]) => {
+  const field = $(fieldSel);
+  const apply = $(applySel);
+  if (!field || !apply) return;
+  const mark = () => {
+    if (!apply.checked) apply.checked = true;
+  };
+  field.addEventListener("focus", mark);
+  field.addEventListener("input", mark);
+});
+
+function setBatchProgress({ show, title, summary, detail, percent }) {
+  const box = $("#batch-progress");
+  const bar = $("#batch-progress-bar");
+  if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (title != null && $("#batch-progress-title")) $("#batch-progress-title").textContent = title;
+  if (summary != null && $("#batch-progress-summary")) $("#batch-progress-summary").textContent = summary;
+  if (detail != null && $("#batch-progress-detail")) $("#batch-progress-detail").textContent = detail;
+  if (bar && percent != null) bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+}
+
+function setBatchBusy(on) {
+  const dlg = $("#batch-dialog");
+  const apply = $("#btn-batch-apply");
+  const cancel = $("#btn-batch-cancel");
+  dlg?.classList.toggle("is-busy", !!on);
+  if (apply) {
+    apply.disabled = !!on;
+    apply.textContent = on ? "处理中…" : "应用到选中";
+  }
+  if (cancel) cancel.disabled = !!on;
+  dlg?.querySelectorAll("input, textarea").forEach((el) => {
+    if (el.id === "btn-batch-apply" || el.id === "btn-batch-cancel") return;
+    el.disabled = !!on;
+  });
+}
+const setBatchDialogBusy = setBatchBusy;
+
+$("#btn-batch-apply")?.addEventListener("click", async () => {
   const { fields, flags } = collectBatchFields();
   if (!Object.keys(flags).length) {
     alert("请至少勾选一个要修改的字段");
@@ -1542,21 +2492,21 @@ $("#btn-batch-apply").addEventListener("click", async () => {
   }
   try {
     if (state.batchTarget === "import") {
-      document.querySelectorAll(".import-item").forEach((row) => {
-        if (!row.querySelector(".pick").checked) return;
+      const root = importListRoot();
+      let applied = 0;
+      root?.querySelectorAll(".import-item").forEach((row) => {
+        const pick = row.querySelector(".pick");
+        if (!pick?.checked || pick.disabled) return;
         if (flags.apply_datetime && fields.datetime) {
-          row.querySelector(".f-datetime").value = toLocalInput(fields.datetime);
+          setImportRowField(row, "datetime", toLocalInput(fields.datetime));
         }
-        if (flags.apply_title) row.querySelector(".f-title").value = fields.title || "";
-        if (flags.apply_description) {
-          row.querySelector(".f-description").value = fields.description || "";
-        }
-        if (flags.apply_location) {
-          row.querySelector(".f-location").value = fields.location || "";
-        }
+        if (flags.apply_title) setImportRowField(row, "title", fields.title || "");
+        if (flags.apply_description) setImportRowField(row, "description", fields.description || "");
+        if (flags.apply_location) setImportRowField(row, "location", fields.location || "");
+        applied += 1;
       });
       $("#batch-dialog").close();
-      alert(`已应用到导入列表 ${document.querySelectorAll(".import-item .pick:checked").length} 张`);
+      alert(`已应用到导入列表 ${applied} 张`);
       return;
     }
     const paths = [...state.selectedPaths];
@@ -1564,25 +2514,103 @@ $("#btn-batch-apply").addEventListener("click", async () => {
       alert("未选中照片");
       return;
     }
-    const r = await api("/api/photo/meta/batch", {
-      method: "POST",
-      body: JSON.stringify({
-        paths,
-        datetime: fields.datetime ?? null,
-        title: fields.title ?? null,
-        description: fields.description ?? null,
-        location: fields.location ?? null,
-        ...flags,
-      }),
+    const needMove = Boolean(flags.apply_datetime || flags.apply_title);
+    // 改时间/简述要重排文件，分片小一些以便进度刷新；只改描述/地点可较大批
+    const CHUNK = needMove ? 3 : 15;
+    setBatchBusy(true);
+    setBatchProgress({
+      show: true,
+      title: needMove ? "正在改写并重排…" : "正在写入元数据…",
+      summary: `0 / ${paths.length}`,
+      detail: needMove
+        ? "改时间/简述会移动文件，稍候…"
+        : "正在批量写入，请稍候…",
+      percent: 0,
     });
-    $("#batch-dialog").close();
+    let okN = 0;
+    let failN = 0;
+    const failMsgs = [];
+    for (let i = 0; i < paths.length; i += CHUNK) {
+      const chunk = paths.slice(i, i + CHUNK);
+      setBatchProgress({
+        show: true,
+        title: needMove ? "正在改写并重排…" : "正在写入元数据…",
+        summary: `${Math.min(i, paths.length)} / ${paths.length} · 成功 ${okN} · 失败 ${failN}`,
+        detail: `本批 ${chunk.length} 项`,
+        percent: (i / paths.length) * 100,
+      });
+      // 让出主线程，刷新进度条
+      await new Promise((r) => requestAnimationFrame(() => r()));
+      try {
+        const r = await api("/api/photo/meta/batch", {
+          method: "POST",
+          body: JSON.stringify({
+            paths: chunk,
+            datetime: fields.datetime ?? null,
+            title: fields.title ?? null,
+            description: fields.description ?? null,
+            location: fields.location ?? null,
+            ...flags,
+          }),
+        });
+        const results = r.results || [];
+        for (const item of results) {
+          if (item.ok) okN += 1;
+          else {
+            failN += 1;
+            if (item.message) failMsgs.push(`${item.path || ""}: ${item.message}`);
+          }
+        }
+        if (!results.length) {
+          if (r.ok) okN += chunk.length;
+          else failN += chunk.length;
+        }
+        setBatchProgress({
+          show: true,
+          summary: `${Math.min(i + chunk.length, paths.length)} / ${paths.length} · 成功 ${okN} · 失败 ${failN}`,
+          detail: r.message || `本批完成 ${chunk.length} 项`,
+          percent: (Math.min(i + chunk.length, paths.length) / paths.length) * 100,
+        });
+      } catch (chunkErr) {
+        failN += chunk.length;
+        failMsgs.push(chunkErr.message || String(chunkErr));
+        setBatchProgress({
+          show: true,
+          summary: `${Math.min(i + chunk.length, paths.length)} / ${paths.length} · 成功 ${okN} · 失败 ${failN}`,
+          detail: chunkErr.message || "本批失败，继续下一批…",
+          percent: (Math.min(i + chunk.length, paths.length) / paths.length) * 100,
+        });
+      }
+    }
+    setBatchProgress({
+      show: true,
+      title: "处理完成",
+      summary: `成功 ${okN} · 失败 ${failN} · 合计 ${paths.length}`,
+      detail: failMsgs.length ? failMsgs.slice(0, 3).join("；") : "正在刷新相册列表…",
+      percent: 100,
+    });
     state.selectedPaths.clear();
     setSelectMode(false);
-    await loadTree(true);
-    await invalidateMapData();
-    alert(r.message || "批量编辑完成");
+    // 仅改描述/地点时不必强制重扫大纲；改时间/简述后必须刷新
+    await loadTree(needMove).catch(console.error);
+    if (needMove) await invalidateMapData().catch(() => {});
+    $("#batch-dialog").close();
+    alert(
+      failN
+        ? `批量编辑完成：成功 ${okN}，失败 ${failN}`
+        : `批量编辑完成：成功 ${okN} 项`
+    );
   } catch (e) {
-    alert(e.message);
+    setBatchProgress({
+      show: true,
+      title: "处理失败",
+      summary: "",
+      detail: e.message || String(e),
+      percent: null,
+    });
+    alert(e.message || String(e));
+  } finally {
+    setBatchBusy(false);
   }
 });
 
@@ -1621,9 +2649,157 @@ function setSelectMode(on, scopeKey = null, paths = null) {
   updateSelectUI();
 }
 
-const IMAGE_EXT = /\.(jpe?g|png|webp|tiff?|bmp|hei[cf])$/i;
-const VIDEO_EXT = /\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|3gp|mts|m2ts)$/i;
-const MEDIA_EXT = /\.(jpe?g|png|webp|tiff?|bmp|hei[cf]|mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|3gp|mts|m2ts)$/i;
+const IMAGE_EXT = /\.(jpe?g|jpe|jfif|png|webp|gif|tiff?|bmp|hei[cf]|avif)$/i;
+const VIDEO_EXT = /\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|mpe|3gp|3g2|mts|m2ts|flv|f4v|wmv|asf|vob|ogv|rm|rmvb)$/i;
+const MEDIA_EXT = /\.(jpe?g|jpe|jfif|png|webp|gif|tiff?|bmp|hei[cf]|avif|mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|mpe|3gp|3g2|mts|m2ts|flv|f4v|wmv|asf|vob|ogv|rm|rmvb)$/i;
+
+/** 浏览器可播地址：能本机解码则直出原件，否则走服务端 remux/转码 */
+function mediaPlayUrl(path, source = "album") {
+  const qs = new URLSearchParams({ path: path || "" });
+  if (source && source !== "album") qs.set("source", source);
+  const caps = browserVideoCaps();
+  if (caps.hevc) qs.set("client_hevc", "1");
+  if (caps.h264) qs.set("client_h264", "1");
+  if (isMobileClient()) qs.set("max_h", "720");
+  if (state.thumbBust) qs.set("v", String(state.thumbBust));
+  return `/api/play?${qs.toString()}`;
+}
+
+function mediaFileUrl(path, source = "album") {
+  const qs = new URLSearchParams({ path: path || "" });
+  if (source && source !== "album") qs.set("source", source);
+  if (state.thumbBust) qs.set("v", String(state.thumbBust));
+  return `/api/file?${qs.toString()}`;
+}
+
+let _videoCapsCache = null;
+function browserVideoCaps() {
+  if (_videoCapsCache) return _videoCapsCache;
+  const v = document.createElement("video");
+  const hevc = Boolean(
+    (v.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') || "").replace("no", "") ||
+      (v.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"') || "").replace("no", "")
+  );
+  const h264 = Boolean(
+    (v.canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"') || "").replace("no", "")
+  );
+  const ua = navigator.userAgent || "";
+  const apple = /Safari|iPhone|iPad|iPod/i.test(ua) && !/CriOS|FxiOS|EdgiOS|Chrome|Android/i.test(ua);
+  _videoCapsCache = {
+    h264,
+    hevc: hevc || apple,
+    apple,
+  };
+  return _videoCapsCache;
+}
+
+function preferDirectVideoFile(path) {
+  const ext = String(path || "").split(".").pop()?.toLowerCase() || "";
+  const caps = browserVideoCaps();
+  if (ext === "webm") return Boolean((document.createElement("video").canPlayType("video/webm") || "").replace("no", ""));
+  if (ext === "mp4" || ext === "m4v") return caps.h264;
+  // MOV 在 Safari/Apple 上常可直出（含 HEVC）；其它浏览器优先走 /api/play
+  if (ext === "mov" || ext === "qt") return caps.hevc || caps.apple;
+  return false;
+}
+
+function setLbVideoPrep(show, title, detail, mode) {
+  const box = $("#lb-video-prep");
+  if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (title != null && $("#lb-video-prep-title")) $("#lb-video-prep-title").textContent = title;
+  if (detail != null && $("#lb-video-prep-detail")) $("#lb-video-prep-detail").textContent = detail;
+  const modeEl = $("#lb-video-prep-mode");
+  if (modeEl && mode) {
+    modeEl.className = `lb-video-prep-mode mode-${mode}`;
+    modeEl.textContent =
+      mode === "client" ? "本机解码" : mode === "server" ? "服务端转码" : mode === "fail" ? "加载失败" : "准备中";
+  }
+}
+
+function setLbVideoModeChip(mode, text) {
+  const chip = $("#lb-video-mode-chip");
+  if (!chip) return;
+  if (!mode) {
+    chip.classList.add("hidden");
+    return;
+  }
+  chip.className = `lb-video-mode-chip mode-${mode}`;
+  chip.textContent =
+    text ||
+    (mode === "client" ? "本机解码" : mode === "server" ? "服务端转码" : mode === "fail" ? "加载失败" : "");
+}
+
+function loadVideoSrc(videoEl, url, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    if (!videoEl || !url) return resolve(false);
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      videoEl.removeEventListener("loadedmetadata", onOk);
+      videoEl.removeEventListener("loadeddata", onOk);
+      videoEl.removeEventListener("canplay", onOk);
+      videoEl.removeEventListener("error", onErr);
+      resolve(ok);
+    };
+    const onOk = () => done(true);
+    const onErr = () => done(false);
+    const timer = setTimeout(() => done(videoEl.readyState >= 2), timeoutMs);
+    videoEl.addEventListener("loadedmetadata", onOk, { once: true });
+    videoEl.addEventListener("loadeddata", onOk, { once: true });
+    videoEl.addEventListener("canplay", onOk, { once: true });
+    videoEl.addEventListener("error", onErr, { once: true });
+    try {
+      videoEl.pause();
+    } catch (_) {}
+    videoEl.src = url;
+    videoEl.load();
+  });
+}
+
+async function bindLightboxVideo(videoEl, path, source = "album") {
+  setLbVideoModeChip(null);
+  setLbVideoPrep(true, "正在准备视频…", "优先本机直出，必要时服务端转码", "client");
+  const direct = mediaFileUrl(path, source);
+  const viaServer = mediaPlayUrl(path, source);
+  const caps = browserVideoCaps();
+  const mobile = isMobileClient();
+  let ok = false;
+  let mode = "server";
+  // 手机非苹果：直出 HEVC/MOV 常要等超时才失败，直接走服务端更快
+  const tryDirect = preferDirectVideoFile(path) && (!mobile || caps.apple);
+  if (tryDirect) {
+    setLbVideoPrep(true, "尝试本机解码…", "优先直出原件，不经树莓派转码", "client");
+    ok = await loadVideoSrc(videoEl, direct, mobile ? 1600 : 8000);
+    if (ok) mode = "client";
+  }
+  if (!ok) {
+    setLbVideoPrep(true, "服务端处理中…", "本机无法直出时 remux/转码，请稍候", "server");
+    try {
+      videoEl.preload = "auto";
+    } catch (_) {}
+    ok = await loadVideoSrc(videoEl, viaServer, 90000);
+    mode = ok ? "server" : "fail";
+  }
+  setLbVideoPrep(false);
+  if (ok) {
+    setLbVideoModeChip(mode);
+    const hint = $("#lb-hint");
+    if (hint) {
+      hint.textContent =
+        mode === "client"
+          ? "播放方式：本机浏览器解码（未转码）"
+          : "播放方式：服务端 remux/转码";
+    }
+  } else {
+    setLbVideoModeChip("fail", "加载失败");
+    const t = $("#lb-title");
+    if (t) t.textContent = (t.textContent || "") + "（视频加载失败）";
+  }
+  return ok;
+}
 
 function isVideoName(name) {
   return VIDEO_EXT.test(name || "");
@@ -1634,12 +2810,30 @@ function isHeicName(name) {
 }
 
 function isMobileClient() {
+  if (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 720px)").matches) {
+    return true;
+  }
   const ua = navigator.userAgent || "";
   return /iPhone|iPad|iPod|Android|Mobile/i.test(ua) || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(ua));
 }
 
+/** 手机看图用更小预览，减轻树莓派生成与蜂窝/Wi‑Fi 传输 */
+function lightboxPreviewSize() {
+  if (isMobileClient()) return 640;
+  if (lb.playing) return 1280;
+  return 1600;
+}
+
+function albumThumbSize() {
+  return isMobileClient() ? 240 : 320;
+}
+
 function setupImportMobileUX() {
   const mobile = isMobileClient();
+  document.body.classList.toggle("is-mobile", mobile);
+  // 手机降低并发，避免缩略图/预览把上行和 CPU 打满
+  albumThumbLoader.max = mobile ? 2 : 4;
+  importPreviewLoader.max = mobile ? 1 : 2;
   const dirBtn = $("#btn-pick-dir");
   const title = $("#drop-title");
   const sub = $("#drop-sub");
@@ -1653,9 +2847,210 @@ function setupImportMobileUX() {
     }
     if (hint) {
       hint.textContent =
-        "手机/平板：用「从相册选择」导入。支持苹果 HEIC、实况、MOV；按字节拷贝，不转码不压画质。上传后自动解析元数据，可编辑后点「入库」。";
+        "点「从相册选择」多选上传；支持 HEIC / 实况 / MOV。上传后勾选再入库。";
     }
   }
+}
+
+const UPLOAD_HIST_KEY = "xiaoshu_upload_dirs_v1";
+const UPLOAD_HIST_MAX = 40;
+
+function loadUploadHist() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(UPLOAD_HIST_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((x) => x && x.root) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveUploadHist(list) {
+  try {
+    localStorage.setItem(UPLOAD_HIST_KEY, JSON.stringify(list.slice(0, UPLOAD_HIST_MAX)));
+  } catch (_) {}
+}
+
+function extractUploadRoots(pairs) {
+  const map = new Map(); // root -> {count, bytes}
+  for (const { file, path } of pairs || []) {
+    const rel = String(path || file?.name || "").replace(/\\/g, "/");
+    const parts = rel.split("/").filter(Boolean);
+    // 仅记录「目录上传」：相对路径至少含一层目录
+    if (parts.length < 2) continue;
+    const root = parts[0];
+    const cur = map.get(root) || { count: 0, bytes: 0 };
+    cur.count += 1;
+    cur.bytes += Number(file?.size) || 0;
+    map.set(root, cur);
+  }
+  return [...map.entries()].map(([root, info]) => ({ root, ...info }));
+}
+
+function rememberUploadRoots(roots) {
+  if (!roots?.length) return;
+  const list = loadUploadHist();
+  const now = Date.now();
+  for (const r of roots) {
+    const idx = list.findIndex((x) => x.root === r.root);
+    if (idx >= 0) {
+      const prev = list[idx];
+      list[idx] = {
+        ...prev,
+        lastAt: now,
+        count: Math.max(Number(prev.count) || 0, r.count || 0),
+        bytes: Math.max(Number(prev.bytes) || 0, r.bytes || 0),
+        uploads: (Number(prev.uploads) || 1) + 1,
+      };
+    } else {
+      list.unshift({
+        id: `uh-${now}-${Math.random().toString(36).slice(2, 7)}`,
+        root: r.root,
+        lastAt: now,
+        count: r.count || 0,
+        bytes: r.bytes || 0,
+        uploads: 1,
+        keepForever: false,
+      });
+    }
+  }
+  // 非永久保留超限时裁掉最旧
+  const pinned = list.filter((x) => x.keepForever);
+  const rest = list.filter((x) => !x.keepForever).sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0));
+  saveUploadHist([...pinned, ...rest].slice(0, UPLOAD_HIST_MAX));
+  renderUploadHist();
+}
+
+function formatHistTime(ts) {
+  if (!ts) return "—";
+  try {
+    return new Date(ts).toLocaleString();
+  } catch (_) {
+    return "—";
+  }
+}
+
+function renderUploadHist() {
+  const listEl = $("#upload-hist-list");
+  const empty = $("#upload-hist-empty");
+  const countEl = $("#upload-hist-count");
+  if (!listEl) return;
+  const list = loadUploadHist().sort((a, b) => {
+    if (Boolean(a.keepForever) !== Boolean(b.keepForever)) return a.keepForever ? -1 : 1;
+    return (b.lastAt || 0) - (a.lastAt || 0);
+  });
+  if (countEl) countEl.textContent = list.length ? `（${list.length}）` : "";
+  listEl.innerHTML = "";
+  if (!list.length) {
+    empty?.classList.remove("hidden");
+    return;
+  }
+  empty?.classList.add("hidden");
+  list.forEach((it) => {
+    const li = document.createElement("li");
+    li.className = `upload-hist-item${it.keepForever ? " keep-forever" : ""}`;
+    li.dataset.id = it.id;
+    li.innerHTML = `
+      <div class="upload-hist-main">
+        <div class="upload-hist-name">${escapeHtml(it.root)}</div>
+        <div class="upload-hist-meta">
+          最近 ${escapeHtml(formatHistTime(it.lastAt))}
+          · ${Number(it.count) || 0} 文件
+          · 上传 ${Number(it.uploads) || 1} 次
+          ${it.keepForever ? " · 永久保留" : ""}
+        </div>
+      </div>
+      <div class="upload-hist-actions">
+        <button type="button" class="btn ghost btn-uh-keep" data-id="${escapeAttr(it.id)}">${
+          it.keepForever ? "取消永久" : "永久保留"
+        }</button>
+        <button type="button" class="btn ghost btn-uh-del" data-id="${escapeAttr(it.id)}">删除</button>
+      </div>`;
+    listEl.appendChild(li);
+  });
+}
+
+function wireUploadHist() {
+  renderUploadHist();
+  $("#upload-hist-list")?.addEventListener("click", (e) => {
+    const keepBtn = e.target.closest?.(".btn-uh-keep");
+    const delBtn = e.target.closest?.(".btn-uh-del");
+    if (keepBtn) {
+      const id = keepBtn.dataset.id;
+      const list = loadUploadHist();
+      const it = list.find((x) => x.id === id);
+      if (it) {
+        it.keepForever = !it.keepForever;
+        saveUploadHist(list);
+        renderUploadHist();
+      }
+      return;
+    }
+    if (delBtn) {
+      const id = delBtn.dataset.id;
+      const list = loadUploadHist().filter((x) => x.id !== id);
+      saveUploadHist(list);
+      renderUploadHist();
+    }
+  });
+}
+
+async function confirmIfKnownUploadDirs(roots) {
+  if (!roots?.length) return true;
+  const hist = loadUploadHist();
+  const hits = roots
+    .map((r) => hist.find((h) => h.root === r.root))
+    .filter(Boolean);
+  if (!hits.length) return true;
+  const lines = hits
+    .map((h) => `· ${h.root}（${formatHistTime(h.lastAt)}，已传 ${h.uploads || 1} 次）`)
+    .join("\n");
+  return confirm(
+    `以下目录曾上传过，继续可能造成重复：\n${lines}\n\n仍要继续上传吗？`
+  );
+}
+
+function applyMediaKindFilter() {
+  const kind = state.mediaKindFilter || "all";
+  document.querySelectorAll(".media-kind-filter .seg-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mediaKind === kind);
+  });
+  // 分类改为走数据库查询：清缓存并重载当前视图
+  clearMonthPhotoCache();
+  if (state.viewMode === "journey" && state.outlineCache) {
+    renderJourney(state.outlineCache);
+  } else if (state.viewMode === "classic") {
+    if (state.classicState) state.classicState.built = false;
+    const root = $("#classic-root");
+    if (root) root.dataset.built = "";
+    ensureClassicView(true).catch(console.error);
+  } else if (state.viewMode === "map" && state.map) {
+    refreshMapClusters().catch(console.error);
+  } else if (state.viewMode === "search") {
+    const q = ($("#search-q")?.value || "").trim();
+    if (q) runSearch(q).catch(console.error);
+  }
+}
+
+function wireMediaKindFilter() {
+  applyMediaKindFilterButtons();
+  document.querySelector(".media-kind-filter")?.addEventListener("click", (e) => {
+    const btn = e.target.closest?.("[data-media-kind]");
+    if (!btn) return;
+    const kind = btn.dataset.mediaKind;
+    if (!["all", "image", "video"].includes(kind)) return;
+    if (state.mediaKindFilter === kind) return;
+    state.mediaKindFilter = kind;
+    localStorage.setItem("xiaoshu_media_kind", kind);
+    applyMediaKindFilterButtons();
+    applyMediaKindFilter();
+  });
+}
+
+function applyMediaKindFilterButtons() {
+  const kind = state.mediaKindFilter || "all";
+  document.querySelectorAll(".media-kind-filter .seg-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mediaKind === kind);
+  });
 }
 
 function entryToFile(entry) {
@@ -1704,11 +3099,17 @@ async function fromDataTransfer(dt) {
 }
 
 const uploadQueue = {
-  items: [], // {id, file, path, status, error, saved}
+  items: [], // {id, file, path, status, error, saved, progress}
   paused: false,
   running: false,
   seq: 0,
+  // 已计入总进度的字节（完成/失败项）
+  settledBytes: 0,
 };
+
+const UPLOAD_LARGE_BYTES = 8 * 1024 * 1024; // 大文件单独传，避免打满 USB
+const UPLOAD_BATCH_MAX_FILES = 4;
+const UPLOAD_BATCH_MAX_BYTES = 16 * 1024 * 1024;
 
 function formatBytes(n) {
   const x = Number(n) || 0;
@@ -1718,6 +3119,55 @@ function formatBytes(n) {
   return `${(x / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+function uploadConcurrency() {
+  // 树莓派 USB 盘 + 千兆网同时写时，过高并发会把 SSH/整机打卡
+  return 1;
+}
+
+function setUploadProgress({ show, title, summary, detail, percent }) {
+  const box = $("#upload-progress");
+  const bar = $("#upload-progress-bar");
+  if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (title != null && $("#upload-progress-title")) $("#upload-progress-title").textContent = title;
+  if (summary != null && $("#upload-progress-summary")) $("#upload-progress-summary").textContent = summary;
+  if (detail != null && $("#upload-progress-detail")) $("#upload-progress-detail").textContent = detail;
+  if (bar && percent != null) bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+}
+
+function uploadQueueTotals() {
+  const items = uploadQueue.items;
+  let totalBytes = 0;
+  let settled = uploadQueue.settledBytes || 0;
+  let inflight = 0;
+  for (const it of items) {
+    const sz = Number(it.file?.size) || 0;
+    totalBytes += sz;
+    if (it.status === "uploading") {
+      inflight += Math.max(0, Math.min(sz, Number(it.loaded) || 0));
+    }
+  }
+  const doneFiles = items.filter((x) => x.status === "done").length;
+  const failFiles = items.filter((x) => x.status === "error").length;
+  const pendingFiles = items.filter((x) => x.status === "pending" || x.status === "uploading").length;
+  const sent = Math.min(totalBytes, settled + inflight);
+  const percent = totalBytes ? (sent / totalBytes) * 100 : 0;
+  return { totalBytes, sent, percent, doneFiles, failFiles, pendingFiles, totalFiles: items.length };
+}
+
+function refreshUploadProgress(detail) {
+  const t = uploadQueueTotals();
+  const active = t.pendingFiles > 0 && !uploadQueue.paused;
+  const show = t.totalFiles > 0 && (active || t.doneFiles + t.failFiles < t.totalFiles || t.sent > 0);
+  setUploadProgress({
+    show: show && (active || uploadQueue.running || uploadQueue.paused),
+    title: uploadQueue.paused ? "上传已暂停" : active ? "正在上传…" : "上传完成",
+    summary: `${t.doneFiles + t.failFiles}/${t.totalFiles} · ${formatBytes(t.sent)} / ${formatBytes(t.totalBytes)}`,
+    detail: detail || $("#upload-progress-detail")?.textContent || "",
+    percent: t.percent,
+  });
+}
+
 function renderUploadQueue() {
   const box = $("#upload-queue");
   const list = $("#upload-queue-list");
@@ -1725,15 +3175,17 @@ function renderUploadQueue() {
   if (!box || !list) return;
   const items = uploadQueue.items;
   box.classList.toggle("hidden", !items.length);
-  const pending = items.filter((x) => x.status === "pending" || x.status === "uploading").length;
-  const done = items.filter((x) => x.status === "done").length;
-  const failed = items.filter((x) => x.status === "error").length;
+  const t = uploadQueueTotals();
   if (sum) {
-    sum.textContent = `${items.length} 项 · 完成 ${done} · 失败 ${failed} · 等待 ${pending}${
+    sum.textContent = `${t.totalFiles} 项 · 完成 ${t.doneFiles} · 失败 ${t.failFiles} · 等待 ${t.pendingFiles}${
       uploadQueue.paused ? " · 已暂停" : ""
     }`;
   }
-  list.innerHTML = items
+  // 仅渲染前 40 + 当前上传中，避免大队列 DOM 卡顿
+  const uploading = items.filter((x) => x.status === "uploading");
+  const rest = items.filter((x) => x.status !== "uploading").slice(0, 36);
+  const view = [...uploading, ...rest];
+  list.innerHTML = view
     .map((it) => {
       const st =
         it.status === "uploading"
@@ -1742,79 +3194,260 @@ function renderUploadQueue() {
             ? "完成"
             : it.status === "error"
               ? "失败"
-              : it.status === "paused"
-                ? "暂停"
-                : "等待";
+              : "等待";
+      const pct = it.status === "uploading" ? Math.round(Number(it.progress) || 0) : it.status === "done" ? 100 : 0;
+      const bar =
+        it.status === "uploading" || it.status === "done"
+          ? `<div class="uq-item-bar"><i style="width:${pct}%"></i></div>`
+          : "";
       return `<li class="uq-item uq-${it.status}" data-id="${it.id}">
         <span class="uq-name" title="${escapeAttr(it.path || it.file?.name || "")}">${escapeHtml(it.file?.name || it.path || "")}</span>
-        <span class="uq-meta muted">${formatBytes(it.file?.size)} · ${st}${it.error ? " · " + escapeHtml(it.error) : ""}</span>
+        <span class="uq-meta muted">${formatBytes(it.file?.size)} · ${st}${
+          it.status === "uploading" && pct ? ` ${pct}%` : ""
+        }${it.error ? " · " + escapeHtml(it.error) : ""}</span>
+        ${bar}
       </li>`;
     })
     .join("");
   const pauseBtn = $("#btn-queue-pause");
   const resumeBtn = $("#btn-queue-resume");
-  pauseBtn?.classList.toggle("hidden", uploadQueue.paused || !pending);
+  pauseBtn?.classList.toggle("hidden", uploadQueue.paused || !t.pendingFiles);
   resumeBtn?.classList.toggle("hidden", !uploadQueue.paused);
+  refreshUploadProgress();
+}
+
+function takeUploadBatch(pending) {
+  if (!pending.length) return [];
+  const first = pending[0];
+  const firstSize = Number(first.file?.size) || 0;
+  if (firstSize >= UPLOAD_LARGE_BYTES) return [first];
+  const batch = [];
+  let bytes = 0;
+  for (const it of pending) {
+    const sz = Number(it.file?.size) || 0;
+    if (sz >= UPLOAD_LARGE_BYTES) break;
+    if (batch.length && (batch.length >= UPLOAD_BATCH_MAX_FILES || bytes + sz > UPLOAD_BATCH_MAX_BYTES)) {
+      break;
+    }
+    batch.push(it);
+    bytes += sz;
+  }
+  return batch;
+}
+
+function xhrUploadForm(form, { onProgress, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/import/upload");
+    xhr.withCredentials = true;
+    xhr.responseType = "json";
+    const abort = () => {
+      try {
+        xhr.abort();
+      } catch (_) {}
+      reject(new Error("已取消"));
+    };
+    if (signal) {
+      if (signal.aborted) return abort();
+      signal.addEventListener("abort", abort, { once: true });
+    }
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      onProgress?.(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      const status = xhr.status;
+      let data = xhr.response;
+      if (typeof data === "string") {
+        try {
+          data = JSON.parse(data);
+        } catch (_) {
+          data = null;
+        }
+      }
+      if (status >= 200 && status < 300) {
+        resolve(data || { ok: true, count: 0, saved: [], skipped: [] });
+        return;
+      }
+      const msg =
+        (data && (data.detail || data.message)) ||
+        xhr.statusText ||
+        `上传失败（${status}）`;
+      reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+    };
+    xhr.onerror = () => reject(new Error("网络错误，上传中断"));
+    xhr.ontimeout = () => reject(new Error("上传超时"));
+    xhr.timeout = 0;
+    xhr.send(form);
+  });
+}
+
+async function uploadBatchItems(batch) {
+  batch.forEach((it) => {
+    it.status = "uploading";
+    it.progress = 0;
+    it.loaded = 0;
+    it.error = "";
+  });
+  renderUploadQueue();
+  const names = batch.map((it) => it.file?.name || it.path).join("、");
+  $("#drop-status").textContent =
+    batch.length > 1 ? `正在上传本批 ${batch.length} 项…` : `正在上传：${names}`;
+  refreshUploadProgress(batch.length > 1 ? `本批 ${batch.length} 项：${names.slice(0, 80)}` : names);
+
+  const form = new FormData();
+  const batchBytes = batch.reduce((n, it) => n + (Number(it.file?.size) || 0), 0);
+  for (const it of batch) {
+    form.append("files", it.file, it.file.name);
+    form.append("paths", it.path || it.file.name);
+  }
+  try {
+    const data = await xhrUploadForm(form, {
+      onProgress: (loaded, total) => {
+        const ratio = total ? loaded / total : 0;
+        let assigned = 0;
+        batch.forEach((it, idx) => {
+          const sz = Number(it.file?.size) || 0;
+          const share = batchBytes ? sz / batchBytes : 1 / batch.length;
+          const est =
+            idx === batch.length - 1 ? Math.max(0, loaded - assigned) : Math.floor(loaded * share);
+          assigned += est;
+          it.loaded = Math.min(sz, est);
+          it.progress = sz ? Math.min(100, (it.loaded / sz) * 100) : ratio * 100;
+        });
+        refreshUploadProgress(
+          batch.length > 1 ? `本批 ${batch.length} 项 · ${formatBytes(loaded)}` : names
+        );
+        batch.forEach((it) => {
+          const li = document.querySelector(`.uq-item[data-id="${it.id}"]`);
+          if (!li) return;
+          const bar = li.querySelector(".uq-item-bar > i");
+          const meta = li.querySelector(".uq-meta");
+          if (bar) bar.style.width = `${Math.round(it.progress || 0)}%`;
+          if (meta) {
+            meta.textContent = `${formatBytes(it.file?.size)} · 上传中 ${Math.round(it.progress || 0)}%`;
+          }
+        });
+      },
+    });
+    const saved = data.saved || [];
+    const skipped = data.skipped || [];
+    const count = Number(data.count) || saved.length || 0;
+    batch.forEach((it) => {
+      const rel = it.path || it.file?.name || "";
+      const name = it.file?.name || "";
+      const wasSkipped = skipped.some(
+        (s) => s === rel || String(s).endsWith(name) || String(s) === name
+      );
+      const savedPath = saved.find(
+        (s) => s === rel || String(s).endsWith(name) || String(s) === name
+      );
+      if (savedPath) it.savedPath = savedPath;
+      if (wasSkipped && count < batch.length) {
+        it.status = "error";
+        it.error = "服务端跳过";
+        it.progress = 0;
+        it.loaded = 0;
+      } else if (count > 0 || saved.length) {
+        it.status = "done";
+        it.saved = 1;
+        it.progress = 100;
+        it.loaded = Number(it.file?.size) || 0;
+        it.error = "";
+      } else {
+        it.status = "error";
+        it.error = "上传失败";
+        it.progress = 0;
+      }
+      uploadQueue.settledBytes += Number(it.file?.size) || 0;
+    });
+  } catch (err) {
+    batch.forEach((it) => {
+      it.status = "error";
+      it.error = err.message || String(err);
+      it.progress = 0;
+      uploadQueue.settledBytes += Number(it.file?.size) || 0;
+    });
+  }
+  renderUploadQueue();
 }
 
 async function pumpUploadQueue() {
   if (uploadQueue.running) return;
   uploadQueue.running = true;
-  const mobile = isMobileClient();
+  importPreviewLoader.pause();
+  const workers = uploadConcurrency();
   try {
-    while (true) {
-      if (uploadQueue.paused) break;
-      const next = uploadQueue.items.find((x) => x.status === "pending");
-      if (!next) break;
-      next.status = "uploading";
-      renderUploadQueue();
-      $("#drop-status").textContent = `正在上传：${next.file?.name || ""}`;
-      try {
-        const form = new FormData();
-        form.append("files", next.file, next.file.name);
-        form.append("paths", next.path || next.file.name);
-        const res = await fetch("/api/import/upload", {
-          method: "POST",
-          body: form,
-          credentials: "same-origin",
+    const runOne = async () => {
+      while (!uploadQueue.paused) {
+        const pending = uploadQueue.items.filter((x) => x.status === "pending");
+        if (!pending.length) return;
+        // 原子领取一批：先标 uploading 占位，避免多 worker 抢同一批
+        const batch = takeUploadBatch(pending);
+        if (!batch.length) return;
+        let claimed = true;
+        for (const it of batch) {
+          if (it.status !== "pending") {
+            claimed = false;
+            break;
+          }
+        }
+        if (!claimed) continue;
+        batch.forEach((it) => {
+          it.status = "uploading";
+          it.progress = 0;
+          it.loaded = 0;
         });
-        if (!res.ok) {
-          let msg = res.statusText;
-          try {
-            const j = await res.json();
-            msg = j.detail || msg;
-          } catch (_) {}
-          throw new Error(typeof msg === "string" ? msg : "上传失败");
-        }
-        const data = await res.json();
-        next.status = "done";
-        next.saved = data.count || 0;
-        if ((data.skipped || []).length) {
-          next.error = "服务端跳过";
-        }
-      } catch (err) {
-        next.status = "error";
-        next.error = err.message || String(err);
+        await uploadBatchItems(batch);
       }
-      renderUploadQueue();
-      if (!mobile) {
-        // 电脑可小批量并行感：仍逐个，避免占满内存
-      }
-    }
+    };
+    await Promise.all(Array.from({ length: workers }, () => runOne()));
   } finally {
     uploadQueue.running = false;
   }
   const saved = uploadQueue.items.filter((x) => x.status === "done").reduce((n, x) => n + (x.saved || 1), 0);
   const failed = uploadQueue.items.filter((x) => x.status === "error").length;
-  $("#drop-status").textContent = uploadQueue.paused
-    ? "上传已暂停"
-    : `队列完成：成功 ${saved}，失败 ${failed}`;
-  if (saved) await loadImport().catch(console.error);
+  const pending = uploadQueue.items.filter((x) => x.status === "pending" || x.status === "uploading").length;
+  if (uploadQueue.paused && pending) {
+    importPreviewLoader.resume();
+    $("#drop-status").textContent = "上传已暂停";
+    refreshUploadProgress("已暂停，点「继续」恢复");
+    return;
+  }
+  refreshUploadProgress(failed ? `成功 ${saved}，失败 ${failed}` : `成功 ${saved} 项`);
+  $("#drop-status").textContent = `队列完成：成功 ${saved}，失败 ${failed}`;
+  if (saved) {
+    $("#drop-status").textContent = `队列完成：成功 ${saved}，失败 ${failed}；正在解析并查重…`;
+    const newPaths = uploadQueue.items
+      .filter((x) => x.status === "done")
+      .map((x) => x.savedPath || x.path)
+      .filter(Boolean);
+    const parseOpts = newPaths.length ? { paths: newPaths } : {};
+    await parseImportList(parseOpts).catch(() => loadImport().catch(console.error));
+  }
+  importPreviewLoader.resume();
+  $("#manage-import")?.classList.remove("is-uploading");
+  // 全部结束后收起进度条（保留队列列表）
+  if (!pending) {
+    setTimeout(() => {
+      if (!uploadQueue.running && !uploadQueue.items.some((x) => x.status === "pending" || x.status === "uploading")) {
+        setUploadProgress({ show: false });
+      }
+    }, 1600);
+  }
 }
 
 async function uploadPairs(pairs) {
+  revealImportUploadView();
   if (!pairs.length) {
     $("#drop-status").textContent = "没有可导入的图片或视频";
+    $("#manage-import")?.classList.remove("is-uploading");
+    return;
+  }
+  const roots = extractUploadRoots(pairs);
+  if (!(await confirmIfKnownUploadDirs(roots))) {
+    $("#drop-status").textContent = "已取消上传（目录曾上传过）";
+    $("#manage-import")?.classList.remove("is-uploading");
     return;
   }
   pairs.forEach(({ file, path }) => {
@@ -1825,11 +3458,27 @@ async function uploadPairs(pairs) {
       status: "pending",
       error: "",
       saved: 0,
+      progress: 0,
+      loaded: 0,
     });
   });
   uploadQueue.paused = false;
+  // settledBytes 只统计本轮已结算；保留历史完成项的体积已在 items 里，重算
+  uploadQueue.settledBytes = uploadQueue.items
+    .filter((x) => x.status === "done" || x.status === "error")
+    .reduce((n, x) => n + (Number(x.file?.size) || 0), 0);
   renderUploadQueue();
+  setUploadProgress({
+    show: true,
+    title: "正在上传…",
+    summary: `0/${pairs.length}`,
+    detail: "准备上传…",
+    percent: 0,
+  });
   await pumpUploadQueue();
+  // 本批有成功项才记入历史上传目录
+  const savedN = uploadQueue.items.filter((x) => x.status === "done").length;
+  if (savedN && roots.length) rememberUploadRoots(roots);
 }
 
 function wireUploadQueueControls() {
@@ -1837,6 +3486,7 @@ function wireUploadQueueControls() {
     uploadQueue.paused = true;
     renderUploadQueue();
     $("#drop-status").textContent = "上传已暂停";
+    refreshUploadProgress("已暂停");
   });
   $("#btn-queue-resume")?.addEventListener("click", () => {
     uploadQueue.paused = false;
@@ -1846,8 +3496,12 @@ function wireUploadQueueControls() {
   $("#btn-queue-retry")?.addEventListener("click", () => {
     uploadQueue.items.forEach((x) => {
       if (x.status === "error") {
+        // 失败项曾计入 settledBytes，重试前扣回
+        uploadQueue.settledBytes = Math.max(0, uploadQueue.settledBytes - (Number(x.file?.size) || 0));
         x.status = "pending";
         x.error = "";
+        x.progress = 0;
+        x.loaded = 0;
       }
     });
     uploadQueue.paused = false;
@@ -1856,134 +3510,282 @@ function wireUploadQueueControls() {
   });
   $("#btn-queue-clear")?.addEventListener("click", () => {
     uploadQueue.items = uploadQueue.items.filter((x) => x.status !== "done");
+    uploadQueue.settledBytes = uploadQueue.items
+      .filter((x) => x.status === "error")
+      .reduce((n, x) => n + (Number(x.file?.size) || 0), 0);
     renderUploadQueue();
+    if (!uploadQueue.items.length) setUploadProgress({ show: false });
   });
 }
 
 const zone = $("#drop-zone");
-["dragenter", "dragover"].forEach((ev) => {
-  zone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    zone.classList.add("dragover");
+if (zone) {
+  ["dragenter", "dragover"].forEach((ev) => {
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      zone.classList.add("dragover");
+    });
   });
-});
-["dragleave", "drop"].forEach((ev) => {
-  zone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    zone.classList.remove("dragover");
+  ["dragleave", "drop"].forEach((ev) => {
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      zone.classList.remove("dragover");
+    });
   });
+  zone.addEventListener("drop", async (e) => {
+    try {
+      const pairs = await fromDataTransfer(e.dataTransfer);
+      await uploadPairs(pairs);
+    } catch (err) {
+      $("#drop-status").textContent = err.message;
+    }
+  });
+}
+
+$("#btn-pick-files")?.addEventListener("click", () => {
+  $("#file-input")?.click();
 });
-zone.addEventListener("drop", async (e) => {
-  try {
-    const pairs = await fromDataTransfer(e.dataTransfer);
-    await uploadPairs(pairs);
-  } catch (err) {
-    $("#drop-status").textContent = err.message;
-  }
+$("#btn-pick-dir")?.addEventListener("click", () => {
+  $("#dir-input")?.click();
 });
 
-$("#btn-pick-files").addEventListener("click", () => {
-  $("#file-input").click();
-});
-$("#btn-pick-dir").addEventListener("click", () => {
-  $("#dir-input").click();
-});
+function revealImportUploadView() {
+  const switched = state.section !== "manage" || state.manageTab !== "import";
+  if (switched) {
+    state.section = "manage";
+    state.manageTab = "import";
+    applySection();
+  }
+  const pane = $("#manage-import");
+  pane?.classList.add("is-uploading");
+  const q = $("#upload-queue");
+  q?.classList.remove("hidden");
+  requestAnimationFrame(() => {
+    q?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+}
 
 function onPicked(input) {
-  const pairs = [...input.files]
-    .filter((file) => MEDIA_EXT.test(file.name))
-    .map((file) => ({ file, path: file.webkitRelativePath || file.name }));
-  uploadPairs(pairs).catch((err) => {
-    $("#drop-status").textContent = err.message;
-  });
+  const files = Array.from(input.files || []);
   input.value = "";
-}
-$("#file-input").addEventListener("change", (e) => onPicked(e.target));
-$("#dir-input").addEventListener("change", (e) => onPicked(e.target));
-
-$("#btn-ingest").addEventListener("click", async () => {
-  const items = [];
-  document.querySelectorAll(".import-item").forEach((row) => {
-    if (!row.querySelector(".pick").checked) return;
-    // 实况伴生 MOV：勿单独入库，入库 HEIC 时会自动带走
-    if (row.dataset.liveCompanion === "1") return;
-    items.push({
-      path: row.dataset.path,
-      datetime: fromLocalInput(row.querySelector(".f-datetime").value),
-      title: row.querySelector(".f-title").value,
-      description: row.querySelector(".f-description").value,
-      location: row.querySelector(".f-location").value,
-    });
+  revealImportUploadView();
+  const n = files.length;
+  if ($("#drop-status")) {
+    $("#drop-status").textContent = n ? `已选择 ${n} 项，正在加入上传队列…` : "没有选中文件";
+  }
+  setUploadProgress({
+    show: true,
+    title: "正在准备上传…",
+    summary: n ? `${n} 项` : "0 项",
+    detail: "相册已关闭，正在加入队列，请稍候",
+    percent: 0,
   });
+  const run = async () => {
+    const pairs = [];
+    for (let i = 0; i < files.length; i += 1) {
+      const file = files[i];
+      if (!file || !MEDIA_EXT.test(file.name)) continue;
+      pairs.push({ file, path: file.webkitRelativePath || file.name });
+      if (i > 0 && i % 50 === 0) {
+        setUploadProgress({
+          show: true,
+          title: "正在准备上传…",
+          summary: `${pairs.length}/${n}`,
+          detail: `加入队列 ${i + 1}/${n}`,
+          percent: n ? (i / n) * 100 : 0,
+        });
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    await uploadPairs(pairs);
+  };
+  run().catch((err) => {
+    if ($("#drop-status")) $("#drop-status").textContent = err.message;
+    $("#manage-import")?.classList.remove("is-uploading");
+  });
+}
+$("#file-input")?.addEventListener("change", (e) => onPicked(e.target));
+$("#dir-input")?.addEventListener("change", (e) => onPicked(e.target));
+
+async function runIngestSelected() {
+  // 若正在入库：只提示，不要改成「已取消」
+  if (ingestState.running) {
+    const stuckMs = Date.now() - (ingestState.startedAt || 0);
+    if (stuckMs < 180000) {
+      $("#drop-status").textContent = "正在入库中…可点右侧「取消入库」停止";
+      setIngestProgress({ show: true });
+      return;
+    }
+    ingestState.running = false;
+  }
+  if (state._detachedImportList) {
+    setBatchUiFrozen(false);
+  }
+
+  const items = collectIngestItems();
   if (!items.length) {
-    alert("请先勾选要入库的项目");
+    const msg = "请先勾选要入库的项目（未勾选的不会入库）";
+    $("#drop-status").textContent = msg;
+    alert(msg);
     return;
   }
+
+  // 不再弹 confirm：点「入库选中项」直接开始，进度条立刻出现
+  const totalAll = state.importItemCount || importListRoot()?.querySelectorAll(".import-item").length || 0;
+  const skipped = Math.max(0, totalAll - items.length);
+
+  ingestState.running = true;
+  ingestState.cancel = false;
+  ingestState.startedAt = Date.now();
+  const btn = $("#btn-ingest");
+  const btnCancel = $("#btn-ingest-cancel");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "入库中…";
+  }
+  if (btnCancel) btnCancel.classList.remove("hidden");
+
+  const results = [];
+  let okN = 0;
+  let failN = 0;
+  const BATCH = 4;
+  setIngestProgress({
+    show: true,
+    title: "正在入库…",
+    summary: `0 / ${items.length}`,
+    detail:
+      (skipped ? `未勾选 ${skipped} 项将跳过。` : "") +
+      `本批准备处理 ${Math.min(BATCH, items.length)} 项`,
+    percent: 2,
+  });
+  $("#drop-status").textContent = `正在入库 0/${items.length}…`;
   try {
-    const data = await api("/api/import/ingest", {
-      method: "POST",
-      body: JSON.stringify({ items }),
-    });
+    $("#ingest-progress")?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+  } catch (_) {}
+
+  try {
+    for (let start = 0; start < items.length; start += BATCH) {
+      if (ingestState.cancel) {
+        for (let j = start; j < items.length; j++) {
+          results.push({ ok: false, path: items[j].path, message: "已取消（未处理）" });
+        }
+        break;
+      }
+      const batch = items.slice(start, start + BATCH);
+      importListRoot()?.querySelectorAll(".import-item").forEach((r) => r.classList.remove("is-ingesting"));
+      batch.forEach((it) => it.row?.classList.add("is-ingesting"));
+      const label = batch.map((it) => it.name || it.path).join("、");
+      setIngestProgress({
+        show: true,
+        title: "正在入库…",
+        summary: `${Math.min(start + batch.length, items.length)} / ${items.length}`,
+        detail: `本批 ${batch.length} 项：${label.slice(0, 80)}${label.length > 80 ? "…" : ""}`,
+        percent: (start / items.length) * 100,
+      });
+      $("#drop-status").textContent = `正在入库 ${start + 1}-${start + batch.length}/${items.length}`;
+      try {
+        const data = await api("/api/import/ingest", {
+          method: "POST",
+          body: JSON.stringify({
+            items: batch.map((it) => ({
+              path: it.path,
+              datetime: it.datetime,
+              title: it.title,
+              description: it.description,
+              location: it.location,
+              content_hash: it.content_hash || null,
+              skip_meta_read: Boolean(it.datetime && (it.title != null)),
+            })),
+          }),
+        });
+        const batchResults = data.results || [];
+        for (let bi = 0; bi < batch.length; bi++) {
+          const it = batch[bi];
+          const r = batchResults[bi] || { ok: false, path: it.path, message: "无返回" };
+          results.push(r);
+          if (r.ok) {
+            okN += 1;
+            it.row?.classList.add("is-ingest-done");
+            if (r.duplicate || r.skipped) it.row?.classList.add("is-duplicate");
+          } else {
+            failN += 1;
+            it.row?.classList.add("is-ingest-fail");
+          }
+        }
+      } catch (e) {
+        for (const it of batch) {
+          failN += 1;
+          results.push({ ok: false, path: it.path, message: e.message || String(e) });
+          it.row?.classList.add("is-ingest-fail");
+        }
+      }
+      setIngestProgress({
+        show: true,
+        title: ingestState.cancel ? "入库已停止" : "正在入库…",
+        summary: `${Math.min(start + batch.length, items.length)} / ${items.length} · 成功 ${okN} · 失败 ${failN}`,
+        detail: `本批：${label.slice(0, 80)}`,
+        percent: (Math.min(start + batch.length, items.length) / items.length) * 100,
+      });
+    }
+
     const log = $("#import-log");
-    log.classList.remove("hidden");
-    log.textContent = data.results
-      .map((r) => (r.ok ? `✓ ${r.path} ${r.message || ""}` : `✗ ${r.path || ""} ${r.message}`))
-      .join("\n");
+    if (log) {
+      log.classList.remove("hidden");
+      log.textContent = results
+        .map((r) => (r.ok ? `✓ ${r.path} ${r.message || ""}` : `✗ ${r.path || ""} ${r.message || ""}`))
+        .join("\n");
+    }
+    const cancelled = ingestState.cancel;
+    setIngestProgress({
+      show: true,
+      title: cancelled ? "入库已停止" : "入库完成",
+      summary: `成功 ${okN} · 失败 ${failN} · 合计 ${results.length}`,
+      detail: cancelled
+        ? "已停止后续项目；成功的已写入相册，失败/未处理项仍在待入库列表。"
+        : failN
+          ? "请查看下方日志。失败项仍留在待入库，可修改后重试。"
+          : "选中项已全部处理。",
+      percent: 100,
+    });
+    $("#drop-status").textContent = cancelled
+      ? `入库已停止：成功 ${okN}，未处理 ${results.length - okN}`
+      : `入库完成：成功 ${okN}，失败 ${failN}`;
+
     await loadImport();
-    await loadTree(true);
-    await invalidateMapData();
+    // 大纲走 SQLite，不必强制重扫盘；入库时已清浏览缓存
+    await loadTree(false).catch(console.error);
+    invalidateMapData().catch(() => {});
   } catch (e) {
     alert(e.message);
+    setIngestProgress({
+      show: true,
+      title: "入库中断",
+      summary: "",
+      detail: e.message || String(e),
+      percent: 0,
+    });
+  } finally {
+    ingestState.running = false;
+    ingestState.cancel = false;
+    ingestState.startedAt = 0;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "入库选中项";
+    }
+    if (btnCancel) btnCancel.classList.add("hidden");
+    importListRoot()?.querySelectorAll(".import-item").forEach((r) => r.classList.remove("is-ingesting"));
   }
-});
+}
 
 function selectedImportPaths() {
   const paths = [];
-  document.querySelectorAll(".import-item").forEach((row) => {
+  importListRoot()?.querySelectorAll(".import-item").forEach((row) => {
     if (!row.querySelector(".pick")?.checked) return;
     if (row.dataset.liveCompanion === "1") return;
     if (row.dataset.path) paths.push(row.dataset.path);
   });
   return paths;
 }
-
-$("#btn-discard-import")?.addEventListener("click", async () => {
-  const paths = selectedImportPaths();
-  if (!paths.length) {
-    alert("请先勾选要移除的项目（仅从待入库删除，不会进相册）");
-    return;
-  }
-  if (!confirm(`确定从待入库移除 ${paths.length} 项？\n文件会从导入区删除，不会写入相册。`)) return;
-  try {
-    const r = await api("/api/import/discard", {
-      method: "POST",
-      body: JSON.stringify({ paths }),
-    });
-    $("#drop-status").textContent = `已移除 ${r.removed || 0} 项`;
-    await loadImport();
-  } catch (e) {
-    alert(e.message);
-  }
-});
-
-$("#btn-clear-import")?.addEventListener("click", async () => {
-  const n = document.querySelectorAll(".import-item").length;
-  if (!n) {
-    alert("待入库列表已空");
-    return;
-  }
-  if (!confirm(`确定清空全部待入库（约 ${n} 项）？\n文件会从导入区删除，不会写入相册。`)) return;
-  try {
-    const r = await api("/api/import/discard", {
-      method: "POST",
-      body: JSON.stringify({ all: true }),
-    });
-    $("#drop-status").textContent = `已清空待入库（移除 ${r.removed || 0} 项）`;
-    await loadImport();
-  } catch (e) {
-    alert(e.message);
-  }
-});
 
 /* Viewer: zoom / pan / crop */
 const viewer = $("#viewer");
@@ -2432,7 +4234,7 @@ function lbPlaySettings() {
   let duration = Number(localStorage.getItem("xiaoshu_lb_duration") || 3);
   let loop = localStorage.getItem("xiaoshu_lb_loop");
   let narration = localStorage.getItem("xiaoshu_lb_narration");
-  if (!["fade", "slide", "cut"].includes(mode)) mode = "fade";
+  if (!["fade", "slide", "zoom", "wipe", "flip", "cut"].includes(mode)) mode = "fade";
   if (![2, 3, 5, 8, 10, 15].includes(duration)) duration = 3;
   return {
     mode,
@@ -2469,6 +4271,28 @@ function lbClearFx() {
   lbFx.style.transform = "";
 }
 
+function lbFxOutClass(mode, dir) {
+  if (mode === "slide") return dir > 0 ? "fx-slide-out-left" : "fx-slide-out-right";
+  if (mode === "zoom") return "fx-zoom-out";
+  if (mode === "wipe") return dir > 0 ? "fx-wipe-out-up" : "fx-wipe-out-down";
+  if (mode === "flip") return "fx-flip-out";
+  return "fx-fade-out";
+}
+
+function lbFxInClass(mode, dir) {
+  if (mode === "slide") return dir > 0 ? "fx-slide-in-left" : "fx-slide-in-right";
+  if (mode === "zoom") return "fx-zoom-in";
+  if (mode === "wipe") return dir > 0 ? "fx-wipe-in-up" : "fx-wipe-in-down";
+  if (mode === "flip") return "fx-flip-in";
+  return "fx-fade-in";
+}
+
+function lbFxMs(mode) {
+  if (mode === "flip" || mode === "zoom") return 480;
+  if (mode === "wipe" || mode === "slide") return 420;
+  return 400;
+}
+
 function lbRunFxPrep(dir) {
   const { mode } = lbPlaySettings();
   if (!lbFx || mode === "cut") {
@@ -2477,19 +4301,13 @@ function lbRunFxPrep(dir) {
   }
   return new Promise((resolve) => {
     lbClearFx();
-    const outCls =
-      mode === "slide"
-        ? dir > 0
-          ? "fx-slide-out-left"
-          : "fx-slide-out-right"
-        : "fx-fade-out";
-    lbFx.classList.add(outCls);
+    lbFx.classList.add(lbFxOutClass(mode, dir));
     const done = () => {
       lbFx.removeEventListener("animationend", done);
       resolve();
     };
     lbFx.addEventListener("animationend", done, { once: true });
-    setTimeout(done, 300);
+    setTimeout(done, lbFxMs(mode));
   });
 }
 
@@ -2501,21 +4319,15 @@ function lbRunFxIn(dir) {
   }
   return new Promise((resolve) => {
     lbFx.className = "lb-fx";
-    const inCls =
-      mode === "slide"
-        ? dir > 0
-          ? "fx-slide-in-left"
-          : "fx-slide-in-right"
-        : "fx-fade-in";
     void lbFx.offsetWidth;
-    lbFx.classList.add(inCls);
+    lbFx.classList.add(lbFxInClass(mode, dir));
     const done = () => {
       lbFx.removeEventListener("animationend", done);
       lbClearFx();
       resolve();
     };
     lbFx.addEventListener("animationend", done, { once: true });
-    setTimeout(done, 400);
+    setTimeout(done, lbFxMs(mode) + 40);
   });
 }
 
@@ -2547,15 +4359,186 @@ function lbStartProgress(ms) {
   lb.progressRaf = requestAnimationFrame(tick);
 }
 
-function lbStopNarration() {
-  if (lb.audioEl) {
+function lbNarrationEl() {
+  return $("#lb-narration-el");
+}
+
+function narrationFetchUrl(photoPath) {
+  if (!photoPath) return "";
+  return `/api/photo/audio?path=${encodeURIComponent(photoPath)}&_=${Date.now()}`;
+}
+
+const _narrEngine = { ctx: null, source: null, token: 0, unlocked: false, path: "" };
+
+function narrationPreviewEl() {
+  return $("#d-narration-audio");
+}
+
+function stopPreviewNarration() {
+  const audio = narrationPreviewEl();
+  if (!audio) return;
+  try {
+    audio.pause();
+    if (Number.isFinite(audio.currentTime)) audio.currentTime = 0;
+  } catch (_) {}
+  if (audio._obj) {
     try {
-      lb.audioEl.pause();
-      lb.audioEl.removeAttribute("src");
-      lb.audioEl.load?.();
+      URL.revokeObjectURL(audio._obj);
     } catch (_) {}
-    lb.audioEl = null;
+    audio._obj = null;
   }
+}
+
+function lbUnlockNarration() {
+  _narrEngine.unlocked = true;
+  const el = lbNarrationEl();
+  if (!el) return;
+  el.muted = false;
+  el.volume = 1;
+  try {
+    el.setAttribute("playsinline", "");
+    el.setAttribute("webkit-playsinline", "true");
+    el.playsInline = true;
+  } catch (_) {}
+  const url = lb.audioUrl || (lb.hasAudio && state.currentPath ? narrationFetchUrl(state.currentPath) : "");
+  if (!url) return;
+  try {
+    if (el.src !== url && !String(el.src || "").includes(encodeURIComponent(state.currentPath || ""))) {
+      el.src = url;
+    }
+    const kick = el.play();
+    if (kick && kick.catch) kick.catch(() => {});
+  } catch (_) {}
+}
+
+function lbHardStopHtmlAudio(el) {
+  if (!el) return;
+  try {
+    el.onended = null;
+    el.onerror = null;
+    el.pause();
+    el.removeAttribute("src");
+    el.load();
+  } catch (_) {}
+}
+
+function lbStopNarration(opts = {}) {
+  const hard = Boolean(opts.hard);
+  _narrEngine.token += 1;
+  _narrEngine.path = "";
+  if (_narrEngine.source) {
+    try {
+      _narrEngine.source.onended = null;
+    } catch (_) {}
+    try {
+      _narrEngine.source.stop();
+    } catch (_) {}
+    try {
+      _narrEngine.source.disconnect();
+    } catch (_) {}
+    _narrEngine.source = null;
+  }
+  const el = lbNarrationEl() || lb.audioEl;
+  lb.audioEl = el || null;
+  if (hard) {
+    lbHardStopHtmlAudio(el);
+    stopPreviewNarration();
+  } else if (el) {
+    try {
+      el.onended = null;
+      el.onerror = null;
+      el.pause();
+    } catch (_) {}
+  }
+}
+
+function lbPlayNarrationNow() {
+  const path = state.currentPath;
+  const url = lb.audioUrl || narrationFetchUrl(path);
+  if (!path || !url) return;
+  const token = ++_narrEngine.token;
+  _narrEngine.path = path;
+  const knownMs = (Number(lb.audioDuration) || 0) * 1000;
+  const { duration } = lbPlaySettings();
+  const settingMs = Math.max(1, duration) * 1000;
+  let advanced = false;
+  stopPreviewNarration();
+
+  const stillThisSlide = () =>
+    token === _narrEngine.token &&
+    lb.playing &&
+    _narrEngine.path === path &&
+    state.currentPath === path &&
+    (state.galleryPaths || [])[state.galleryIndex] === path;
+
+  const advance = () => {
+    if (advanced || !stillThisSlide()) return;
+    advanced = true;
+    if (lb.timer) {
+      clearTimeout(lb.timer);
+      lb.timer = null;
+    }
+    const elNow = lbNarrationEl();
+    if (elNow) elNow.onended = null;
+    lbStopNarration({ hard: false });
+    if (!lb.playing) return;
+    lbGo(1, { autoplay: true });
+  };
+
+  const armEndWatch = (narrMs) => {
+    const wait = Math.max(400, Number(narrMs) || 0);
+    lbStartProgress(wait);
+    if (lb.timer) clearTimeout(lb.timer);
+    lb.timer = setTimeout(() => {
+      if (!stillThisSlide()) return;
+      advance();
+    }, wait + 1200);
+  };
+
+  const el = lbNarrationEl();
+  lb.audioEl = el || null;
+  if (!el) {
+    if (lb.timer) clearTimeout(lb.timer);
+    lb.timer = setTimeout(advance, settingMs);
+    lbStartProgress(settingMs);
+    return;
+  }
+  el.muted = false;
+  el.volume = 1;
+  try {
+    el.setAttribute("playsinline", "");
+    el.setAttribute("webkit-playsinline", "true");
+    el.playsInline = true;
+  } catch (_) {}
+  try {
+    el.pause();
+  } catch (_) {}
+  el.onended = () => advance();
+  el.onerror = () => {
+    if (!stillThisSlide()) return;
+    if (lb.timer) clearTimeout(lb.timer);
+    lb.timer = setTimeout(advance, settingMs);
+    lbStartProgress(settingMs);
+  };
+  el.src = url;
+  const kick = el.play();
+  if (kick && kick.catch) {
+    kick.catch(() => {
+      if (!stillThisSlide()) return;
+      if (lb.timer) clearTimeout(lb.timer);
+      lb.timer = setTimeout(advance, settingMs);
+      lbStartProgress(settingMs);
+    });
+  }
+  const applyDur = () => {
+    if (!stillThisSlide()) return;
+    const d = Number(el.duration);
+    if (Number.isFinite(d) && d > 0) armEndWatch(d * 1000);
+    else if (knownMs) armEndWatch(knownMs);
+  };
+  if (el.readyState >= 1) applyDur();
+  else el.addEventListener("loadedmetadata", applyDur, { once: true });
+  if (knownMs) lbStartProgress(knownMs);
 }
 
 function lbStopAutoplay() {
@@ -2564,7 +4547,7 @@ function lbStopAutoplay() {
     clearTimeout(lb.timer);
     lb.timer = null;
   }
-  lbStopNarration();
+  lbStopNarration({ hard: true });
   lbStopProgress();
   const btn = $("#lb-play");
   if (btn) {
@@ -2581,7 +4564,7 @@ function lbScheduleNext() {
     clearTimeout(lb.timer);
     lb.timer = null;
   }
-  lbStopNarration();
+  lbStopNarration({ hard: false });
   const { duration, narration: playNarration } = lbPlaySettings();
   const ms = Math.max(1, duration) * 1000;
 
@@ -2598,53 +4581,21 @@ function lbScheduleNext() {
     lbVideo.removeEventListener("ended", advance);
     const tryPlay = () => {
       const vidMs = (Number(lbVideo.duration) || 0) * 1000;
-      const wait = Math.max(ms, vidMs > 0 ? vidMs : ms);
+      // 视频：严格按视频时长（至少等 ended）；设置时长仅作下限兜底
+      const wait = vidMs > 0 ? Math.max(ms, vidMs) : Math.max(ms, 8000);
       lbStartProgress(wait);
       lbVideo.play?.().catch(() => {});
-      if (vidMs > 0 && Number.isFinite(lbVideo.duration)) {
-        lbVideo.addEventListener("ended", advance, { once: true });
-        lb.timer = setTimeout(advance, wait + 200);
-      } else {
-        lb.timer = setTimeout(advance, ms);
-      }
+      lbVideo.addEventListener("ended", advance, { once: true });
+      lb.timer = setTimeout(advance, wait + 400);
     };
     if (lbVideo.readyState >= 1) tryPlay();
     else lbVideo.addEventListener("loadedmetadata", tryPlay, { once: true });
     return;
   }
 
-  // 图片有旁白且开启「播放旁白」：按时长切换并播音频
-  if (playNarration && lb.hasAudio && lb.audioUrl) {
-    const audio = new Audio(lb.audioUrl);
-    lb.audioEl = audio;
-    const advance = () => {
-      audio.removeEventListener("ended", advance);
-      if (lb.timer) {
-        clearTimeout(lb.timer);
-        lb.timer = null;
-      }
-      if (!lb.playing) return;
-      lbGo(1, { autoplay: true });
-    };
-    const tryPlay = () => {
-      const known = Number(lb.audioDuration) || 0;
-      const probed = Number(audio.duration) || 0;
-      const audMs = Math.max(known, probed > 0 && Number.isFinite(probed) ? probed : 0) * 1000;
-      const wait = audMs > 0 ? audMs : ms;
-      lbStartProgress(wait);
-      audio.play?.().catch(() => {});
-      audio.addEventListener("ended", advance, { once: true });
-      lb.timer = setTimeout(advance, wait + 250);
-    };
-    if (audio.readyState >= 1) tryPlay();
-    else audio.addEventListener("loadedmetadata", tryPlay, { once: true });
-    audio.addEventListener("error", () => {
-      lbStartProgress(ms);
-      lb.timer = setTimeout(() => {
-        if (!lb.playing) return;
-        lbGo(1, { autoplay: true });
-      }, ms);
-    }, { once: true });
+  // 图片有旁白且开启「播放旁白」：等旁白播完再切
+  if (playNarration && lb.hasAudio && (lb.audioUrl || state.currentPath)) {
+    lbPlayNarrationNow();
     return;
   }
 
@@ -2670,6 +4621,8 @@ function lbStartAutoplay() {
   lbDialog?.classList.add("is-playing");
   $("#lb-play-panel")?.classList.add("hidden");
   lbResetView();
+  stopPreviewNarration();
+  lbUnlockNarration();
   lbScheduleNext();
 }
 
@@ -2741,7 +4694,7 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   lbUpdateChrome();
   lbResetView();
   lbStopLive();
-  lbStopNarration();
+  lbStopNarration({ hard: !lb.playing });
   lb.hasAudio = false;
   lb.audioUrl = null;
   lb.audioDuration = null;
@@ -2760,53 +4713,110 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   const dir = opts.dir || lb.lastDelta || 1;
   if (opts.withFx) await lbRunFxPrep(dir);
 
+  const bust = state.thumbBust || 0;
+  // 手机用 960：生成/传输更快；电脑手动看图 1600，幻灯片略小
+  const previewSize = lightboxPreviewSize();
+  const thumbUrl = `/api/thumb?path=${encodeURIComponent(path)}&size=${albumThumbSize()}&_=${bust}`;
+  const midUrl = `/api/thumb?path=${encodeURIComponent(path)}&size=${isMobileClient() ? 480 : 640}&_=${bust}`;
+  const previewUrl = `/api/preview?path=${encodeURIComponent(path)}&size=${previewSize}&_=${bust}`;
+
+  const applyUrl = (url) =>
+    new Promise((resolve) => {
+      if (!lbImg) return resolve(false);
+      const finish = (ok) => {
+        lbImg.removeEventListener("load", onLoad);
+        lbImg.removeEventListener("error", onErr);
+        lbImg.style.opacity = "1";
+        resolve(ok);
+      };
+      const onLoad = () => finish(true);
+      const onErr = () => finish(false);
+      try {
+        const abs = new URL(url, location.origin).href;
+        if (lbImg.src === abs && lbImg.complete && lbImg.naturalWidth > 0) {
+          finish(true);
+          return;
+        }
+      } catch (_) {}
+      lbImg.addEventListener("load", onLoad, { once: true });
+      lbImg.addEventListener("error", onErr, { once: true });
+      lbImg.src = url;
+    });
+
+  // 图片：先展示缩略/中图，大图与 meta 并行，缩短「空白等待」
+  if (!hintVid) {
+    lbImg.style.opacity = "0.55";
+    const cached = lbPreviewCacheGet(previewUrl) || lbPreviewCacheGet(midUrl);
+    if (cached) {
+      lbImg.src = cached;
+      lbImg.style.opacity = "1";
+    } else {
+      lbImg.src = thumbUrl;
+      // 尽快升到 640，观感比干等 1600 好
+      void applyUrl(midUrl);
+    }
+  }
+
+  // 幻灯片翻页时先预取邻居，和下方解码并行
+  lbPrefetchNeighbors({ deep: Boolean(lb.playing) });
+
   try {
-    const data = await api(`/api/photo?path=${encodeURIComponent(path)}`);
+    const photoPromise = api(`/api/photo?path=${encodeURIComponent(path)}`);
+    const videoBindP = hintVid ? bindLightboxVideo(lbVideo, path, "album") : null;
+    if (!hintVid) {
+      const upgradePreview = () => {
+        void lbPreloadImage(previewUrl).then(async (ok) => {
+          if (state.galleryPaths[state.galleryIndex] !== path) return;
+          if (ok) {
+            lbPreviewCachePut(previewUrl);
+            await applyUrl(previewUrl);
+          }
+        });
+      };
+      // 手机先看中图，大图稍后再升清，避免卡在生成预览
+      if (isMobileClient() && !lb.playing) {
+        setTimeout(() => {
+          if (state.galleryPaths[state.galleryIndex] !== path) return;
+          upgradePreview();
+        }, 320);
+      } else {
+        upgradePreview();
+      }
+    }
+
+    const data = await photoPromise;
     if (state.galleryPaths[state.galleryIndex] !== path) return;
+
     const kind = data.kind || (isVideoName(data.name || path) ? "video" : "image");
     lb.kind = kind;
-    lb.hasAudio = Boolean(data.has_audio && data.audio_path);
-    lb.audioUrl = lb.hasAudio
-      ? `/api/file?path=${encodeURIComponent(data.audio_path)}&t=${Date.now()}`
-      : null;
+    lb.hasAudio = Boolean(data.has_audio && (data.audio_path || data.has_audio));
+    lb.audioUrl = lb.hasAudio ? narrationFetchUrl(path) : null;
     lb.audioDuration = data.audio_duration != null ? Number(data.audio_duration) : null;
     lbImg.classList.toggle("hidden", kind === "video");
     lbVideo.classList.toggle("hidden", kind !== "video");
     $("#lb-title").textContent =
       (data.meta && data.meta.title) || data.name || path.split("/").pop();
-    const fileUrl = `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
-    const previewUrl = `/api/preview?path=${encodeURIComponent(path)}&size=2000&t=${Date.now()}`;
-    const mobile = isMobileClient();
+    const fileUrl = kind === "video" ? null : `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+
     if (kind === "video") {
       lbImg.removeAttribute("src");
-      lbVideo.pause();
-      lbVideo.src = fileUrl;
-      lbVideo.load();
+      lbImg.style.opacity = "";
+      await (videoBindP || bindLightboxVideo(lbVideo, path, "album"));
     } else {
+      setLbVideoPrep(false);
+      setLbVideoModeChip(null);
       lbVideo.pause();
       lbVideo.removeAttribute("src");
       lbVideo.load();
-      const loadOnce = (url) =>
-        new Promise((resolve) => {
-          const done = (ok) => {
-            lbImg.removeEventListener("load", onLoad);
-            lbImg.removeEventListener("error", onErr);
-            resolve(ok);
-          };
-          const onLoad = () => done(true);
-          const onErr = () => done(false);
-          lbImg.addEventListener("load", onLoad, { once: true });
-          lbImg.addEventListener("error", onErr, { once: true });
-          lbImg.src = url;
-        });
-      // 手机端优先用预览图：省流量、避 HEIC/超大原图在 Safari 黑屏
-      const preferPreview = mobile || isHeicName(data.name || path);
-      let ok = await loadOnce(preferPreview ? previewUrl : fileUrl);
-      if (!ok) {
-        ok = await loadOnce(preferPreview ? fileUrl : previewUrl);
-      }
-      if (!ok) {
-        $("#lb-title").textContent = "图片加载失败";
+      if (!(lbImg.complete && lbImg.naturalWidth > 0)) {
+        const okMid = await applyUrl(midUrl);
+        if (!okMid) {
+          const okFile = await applyUrl(fileUrl);
+          if (!okFile) {
+            $("#lb-title").textContent = "图片加载失败";
+            lbImg.style.opacity = "1";
+          }
+        }
       }
       lbSetupLive(data);
     }
@@ -2820,12 +4830,102 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
           ? "自动播放中 · 本张按旁白时长切换"
           : "自动播放中 · 点「暂停」停止 ·「设置」可改模式与时长";
     }
+    lbPrefetchNeighbors({ deep: true });
   } catch (e) {
     $("#lb-title").textContent = e.message || "加载失败";
+    lbImg.style.opacity = "1";
     lbClearFx();
   }
 
-  if (lb.playing) lbScheduleNext();
+  if (lb.playing) {
+    // 幻灯片：有中图/大图任一显示即可开计时，勿死等 2.5s
+    if (lb.kind !== "video" && lbImg && !(lbImg.complete && lbImg.naturalWidth > 0)) {
+      await Promise.race([
+        new Promise((resolve) => {
+          const done = () => resolve();
+          lbImg.addEventListener("load", done, { once: true });
+          lbImg.addEventListener("error", done, { once: true });
+        }),
+        new Promise((resolve) => setTimeout(resolve, 900)),
+      ]);
+      if (state.galleryPaths[state.galleryIndex] !== path) return;
+    }
+    lbScheduleNext();
+  }
+}
+
+const lbPreviewCache = new Map(); // url -> true（浏览器 HTTP 缓存已热）
+function lbPreviewCachePut(url) {
+  if (!url) return;
+  lbPreviewCache.set(url, true);
+  if (lbPreviewCache.size > 40) {
+    const first = lbPreviewCache.keys().next().value;
+    lbPreviewCache.delete(first);
+  }
+}
+function lbPreviewCacheGet(url) {
+  return lbPreviewCache.has(url) ? url : null;
+}
+function lbPreloadImage(url) {
+  return new Promise((resolve) => {
+    if (!url) return resolve(false);
+    if (lbPreviewCache.has(url)) return resolve(true);
+    const im = new Image();
+    im.decoding = "async";
+    im.onload = () => resolve(true);
+    im.onerror = () => resolve(false);
+    im.src = url;
+  });
+}
+
+function lbPrefetchNeighbors(opts = {}) {
+  const paths = state.galleryPaths || [];
+  const i = state.galleryIndex || 0;
+  const bust = state.thumbBust || 0;
+  const deep = Boolean(opts.deep);
+  const mobile = isMobileClient();
+  // 手机少预取，避免 Wi‑Fi/树莓派被邻居大图占满
+  const span = mobile ? (deep || lb.playing ? 1 : 0) : deep || lb.playing ? 4 : 1;
+  const previewSize = lightboxPreviewSize();
+  const midSize = mobile ? 480 : 640;
+  const run = (idx, heavy) => {
+    if (idx < 0 || idx >= paths.length) return;
+    const p = paths[idx];
+    if (!p) return;
+    if (isVideoName(p)) {
+      if (!mobile) {
+        const u = mediaPlayUrl(p);
+        fetch(u, { method: "GET", headers: { Range: "bytes=0-1" } }).catch(() => {});
+      }
+      return;
+    }
+    const preview = `/api/preview?path=${encodeURIComponent(p)}&size=${previewSize}&_=${bust}`;
+    const mid = `/api/thumb?path=${encodeURIComponent(p)}&size=${midSize}&_=${bust}`;
+    const th = `/api/thumb?path=${encodeURIComponent(p)}&size=${albumThumbSize()}&_=${bust}`;
+    void lbPreloadImage(th);
+    void lbPreloadImage(mid).then((ok) => {
+      if (ok) lbPreviewCachePut(mid);
+    });
+    // 手机只预热中图；大图等真正滑到再拉
+    if (heavy && !mobile) {
+      void lbPreloadImage(preview).then((ok) => {
+        if (ok) lbPreviewCachePut(preview);
+      });
+    }
+  };
+  if (span <= 0) return;
+  if (deep || lb.playing) {
+    for (let d = 1; d <= span; d++) {
+      run(i + d, true);
+      if (d <= (mobile ? 1 : 2)) run(i - d, false);
+    }
+    return;
+  }
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 50));
+  idle(() => {
+    run(i + 1, !mobile);
+    if (!mobile) run(i - 1, false);
+  });
 }
 
 
@@ -2852,14 +4952,18 @@ function lbDownloadCurrent() {
 }
 
 function openLightbox(path, paths = null, hintMeta = null) {
-  const list =
-    Array.isArray(paths) && paths.length ? paths.slice() : [path];
+  path = canonicalizeAlbumPath(path);
+  const list = (Array.isArray(paths) && paths.length ? paths.slice() : [path]).map(
+    canonicalizeAlbumPath
+  );
   state.galleryPaths = list;
-  state.galleryIndex = Math.max(0, list.indexOf(path));
+  state.galleryIndex = list.indexOf(path);
   if (state.galleryIndex < 0) {
     state.galleryPaths = [path];
     state.galleryIndex = 0;
   }
+  state.currentPath = path;
+  state.editReturnPath = path;
   state.reopenLightbox = false;
   lbStopAutoplay();
   $("#lb-play-panel")?.classList.add("hidden");
@@ -2908,6 +5012,8 @@ function lbOpenEdit() {
 $("#lb-close")?.addEventListener("click", () => {
   lbStopAutoplay();
   lbVideo?.pause();
+  setLbVideoPrep(false);
+  setLbVideoModeChip(null);
   lbDialog?.close();
 });
 $("#lb-prev")?.addEventListener("click", () => {
@@ -3075,17 +5181,33 @@ lbViewport?.addEventListener("pointerleave", (e) => {
 });
 
 $("#detail-dialog")?.addEventListener("close", () => {
+  stopPreviewNarration();
+  stopNarrationMeter();
+  try {
+    if (_narrationRecorder && _narrationRecorder.state !== "inactive") {
+      _narrationRecorder.stop();
+    }
+  } catch (_) {}
+  stopNarrationTracks().catch(() => {});
+  lbStopNarration({ hard: true });
   if (!state.reopenLightbox) return;
   state.reopenLightbox = false;
-  const path = state.currentPath || (state.galleryPaths || [])[state.galleryIndex];
+  const path = canonicalizeAlbumPath(
+    state.editReturnPath || state.currentPath || (state.galleryPaths || [])[state.galleryIndex]
+  );
   if (!path) return;
-  // 编辑后回到看图
-  openLightbox(path, state.galleryPaths.length ? state.galleryPaths : [path]);
+  const list = (state.galleryPaths || []).map(canonicalizeAlbumPath).filter(Boolean);
+  openLightbox(path, list.length ? list : [path]);
 });
 
 async function openDetail(path, hintMeta = null) {
   const req = ++_detailReq;
+  stopPreviewNarration();
+  if (lb.playing) lbStopAutoplay();
+  else lbStopNarration({ hard: true });
+  path = canonicalizeAlbumPath(path);
   state.currentPath = path;
+  state.editReturnPath = path;
   state.pendingRotate = 0;
   state.trimDirty = false;
   setCropEnabled(false);
@@ -3116,11 +5238,9 @@ async function openDetail(path, hintMeta = null) {
     updateLocationHint($("#d-location").value);
     $("#detail-msg").textContent = path;
     updateNarrationUI(data);
-    const url = `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+    const url = kind === "video" ? null : `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
     if (kind === "video") {
-      videoEl.pause();
-      videoEl.src = url;
-      videoEl.load();
+      await bindLightboxVideo(videoEl, path, "album");
       stage.style.transform = "";
       updateCoverHint(data.cover_time, data.has_cover);
       const onMeta = () => {
@@ -3144,10 +5264,8 @@ async function openDetail(path, hintMeta = null) {
       updateCoverHint(null, false);
       videoEl.removeAttribute("src");
       videoEl.load();
-      // HEIC：多数浏览器不能直接显示原件，用预览 JPEG（不改相册原件）
-      imgEl.src = isHeicName(data.name || path)
-        ? `/api/preview?path=${encodeURIComponent(path)}&size=1600&t=${Date.now()}`
-        : url;
+      // 统一用预览 JPEG（落盘缓存）；原件仅下载时走 /api/file
+      imgEl.src = `/api/preview?path=${encodeURIComponent(path)}&size=1600&t=${Date.now()}`;
       requestAnimationFrame(() => {
         computeFit();
         applyViewerTransform();
@@ -3262,20 +5380,18 @@ async function saveMetaOnly(opts = {}) {
     method: "PUT",
     body: JSON.stringify(body),
   });
-  state.currentPath = r.path || state.currentPath;
+  state.currentPath = canonicalizeAlbumPath(r.path || state.currentPath);
+  state.editReturnPath = state.currentPath;
   // 同步 gallery 路径（另存后可能改名）
   if (state.galleryPaths?.length && state.galleryIndex >= 0) {
     state.galleryPaths[state.galleryIndex] = state.currentPath;
   }
   $("#detail-msg").textContent = r.message || "已保存";
-  const url = `/api/file?path=${encodeURIComponent(state.currentPath)}&t=${Date.now()}`;
   if (state.mediaKind === "video") {
-    videoEl.src = url;
+    videoEl.src = mediaPlayUrl(state.currentPath);
     videoEl.load();
   } else {
-    imgEl.src = isHeicName(state.currentPath)
-      ? `/api/preview?path=${encodeURIComponent(state.currentPath)}&size=1600&t=${Date.now()}`
-      : url;
+    imgEl.src = `/api/preview?path=${encodeURIComponent(state.currentPath)}&size=1600&t=${Date.now()}`;
   }
   if (refreshViews) {
     // 整库扫描较慢，放到微任务后，避免卡住弹窗确认按钮
@@ -3285,6 +5401,14 @@ async function saveMetaOnly(opts = {}) {
     });
   }
   return r;
+}
+
+function closeDetailAfterSave() {
+  try {
+    $("#save-mode-dialog")?.close();
+  } catch (_) {}
+  const dlg = $("#detail-dialog");
+  if (dlg?.open) dlg.close();
 }
 
 function hasMediaEdits() {
@@ -3321,6 +5445,7 @@ $("#btn-save").addEventListener("click", async () => {
   $("#detail-msg").textContent = "保存中…";
   try {
     await saveMetaOnly();
+    closeDetailAfterSave();
   } catch (e) {
     alert(e.message);
     $("#detail-msg").textContent = e.message;
@@ -3372,17 +5497,15 @@ $("#btn-save-confirm").addEventListener("click", async () => {
     state.trimDirty = false;
     videoEl.style.transform = "";
     setCropEnabled(false);
-    state.currentPath = r.path || state.currentPath;
+    state.currentPath = canonicalizeAlbumPath(r.path || state.currentPath);
     state.thumbBust = r.thumb_bust || Date.now();
     status.textContent = "已写回，正在同步信息…";
     await saveMetaOnly({ refreshViews: false });
     if (state.mediaKind === "video") {
-      videoEl.src = `/api/file?path=${encodeURIComponent(state.currentPath)}&t=${Date.now()}`;
+      videoEl.src = mediaPlayUrl(state.currentPath);
       videoEl.load();
     } else {
-      imgEl.src = isHeicName(state.currentPath)
-        ? `/api/preview?path=${encodeURIComponent(state.currentPath)}&size=1600&t=${Date.now()}`
-        : `/api/file?path=${encodeURIComponent(state.currentPath)}&t=${Date.now()}`;
+      imgEl.src = `/api/preview?path=${encodeURIComponent(state.currentPath)}&size=1600&t=${Date.now()}`;
     }
     $("#save-mode-dialog").close();
     $("#detail-msg").textContent = (r.message || "已保存") + "；信息已同步";
@@ -3390,6 +5513,7 @@ $("#btn-save-confirm").addEventListener("click", async () => {
       loadTree().catch(console.error);
       invalidateMapData().catch(console.error);
     });
+    closeDetailAfterSave();
   } catch (e) {
     status.textContent = e.message || "写回失败";
     alert(e.message);
@@ -3421,7 +5545,8 @@ function applyMapSettingsForm(cfg) {
 }
 
 async function loadSettings() {
-  const cfg = await api("/api/config?stats=1");
+  refreshAuthSettingsUI();
+  const cfg = await api("/api/config");
   const form = $("#settings-form");
   if (form?.album_root) form.album_root.value = cfg.album_root || "";
   if (form?.thumb_root) form.thumb_root.value = cfg.thumb_root || "";
@@ -3432,12 +5557,18 @@ async function loadSettings() {
   updateAlbumRootStatus(cfg);
   updateThumbRootStatus(cfg);
   applyTheme(localStorage.getItem("xiaoshu_theme") || "fresh");
-  refreshMapPackStatus().catch(console.error);
-  refreshAuthSettingsUI();
   renderShareYearChips(cfg.album_years || []);
   if (state.me?.can_settings) {
     loadShares().catch(console.error);
     refreshIndexStatus().catch(console.error);
+    refreshMapPackStatus().catch(console.error);
+    api("/api/config?stats=1")
+      .then((full) => {
+        updateAlbumRootStatus(full);
+        updateThumbRootStatus(full);
+        applyMapSettingsForm(full);
+      })
+      .catch(console.error);
   }
 }
 
@@ -3581,15 +5712,18 @@ function renderShareYearChips(years) {
 }
 
 function setShareMode(mode) {
-  state.shareMode = mode === "media" ? "media" : "years";
+  const allowed = ["years", "media", "search"];
+  state.shareMode = allowed.includes(mode) ? mode : "years";
   document.querySelectorAll("[data-share-mode]").forEach((b) => {
     b.classList.toggle("active", b.dataset.shareMode === state.shareMode);
   });
   $("#share-years-box")?.classList.toggle("hidden", state.shareMode !== "years");
   $("#share-media-box")?.classList.toggle("hidden", state.shareMode !== "media");
+  $("#share-search-box")?.classList.toggle("hidden", state.shareMode !== "search");
   if (state.shareMode === "media" && !state.shareMediaLoaded) {
     loadShareMediaPicker().catch(console.error);
   }
+  updateShareMediaCount();
 }
 
 document.querySelectorAll("[data-share-mode]").forEach((btn) => {
@@ -3597,29 +5731,83 @@ document.querySelectorAll("[data-share-mode]").forEach((btn) => {
 });
 
 function updateShareMediaCount() {
+  const n = state.shareMediaPaths.size;
   const el = $("#share-media-count");
-  if (el) el.textContent = `已选 ${state.shareMediaPaths.size}`;
+  if (el) el.textContent = `已选 ${n}`;
+  const s = $("#share-search-count");
+  if (s && state.shareMode === "search") {
+    const hit = state.shareSearchItems.filter((p) => state.shareMediaPaths.has(p.path)).length;
+    s.textContent = state.shareSearchItems.length
+      ? `结果 ${state.shareSearchItems.length} · 已勾 ${hit} · 合计已选 ${n}`
+      : `合计已选 ${n}`;
+  }
+}
+
+function shareThumbUrl(path) {
+  const size = isMobileClient() ? 120 : 160;
+  return `/api/thumb?path=${encodeURIComponent(path)}&size=${size}&_=${state.thumbBust || 0}`;
+}
+
+function syncShareMediaItemActive() {
+  document.querySelectorAll(".share-media-item").forEach((btn) => {
+    const p = btn.dataset.path;
+    btn.classList.toggle("active", Boolean(p && state.shareMediaPaths.has(p)));
+  });
+  updateShareMediaCount();
+}
+
+function toggleShareMediaPath(path) {
+  if (!path) return;
+  if (state.shareMediaPaths.has(path)) state.shareMediaPaths.delete(path);
+  else state.shareMediaPaths.add(path);
+  syncShareMediaItemActive();
+}
+
+function shareSelectPaths(paths, on) {
+  (paths || []).forEach((p) => {
+    if (!p) return;
+    if (on) state.shareMediaPaths.add(p);
+    else state.shareMediaPaths.delete(p);
+  });
+  syncShareMediaItemActive();
+}
+
+function appendShareMediaItem(grid, p) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "share-media-item" + (state.shareMediaPaths.has(p.path) ? " active" : "");
+  btn.dataset.path = p.path;
+  const title = (p.meta && p.meta.title) || p.name || String(p.path || "").split("/").pop();
+  const vid = p.kind === "video" || isVideoName(p.path || p.name || "");
+  btn.innerHTML = `<span class="share-media-inner"><img loading="lazy" decoding="async" src="${shareThumbUrl(
+    p.path
+  )}" alt="" />${vid ? `<i class="kind-tag">视频</i>` : ""}<span class="share-media-name">${escapeHtml(
+    title
+  )}</span></span>`;
+  btn.addEventListener("click", () => toggleShareMediaPath(p.path));
+  grid.appendChild(btn);
 }
 
 async function loadShareMediaPicker() {
   const grid = $("#share-media-grid");
   if (!grid) return;
-  grid.innerHTML = `<p class="muted">加载中…</p>`;
+  grid.innerHTML = `<p class="muted share-month-head">加载中…</p>`;
+  state.shareMediaVisible = [];
   const outline = await api("/api/timeline/outline");
   const months = outlineMonthList(outline).slice(0, 24);
   grid.innerHTML = "";
   if (!months.length) {
-    grid.innerHTML = `<p class="muted">相册为空</p>`;
+    grid.innerHTML = `<p class="muted share-month-head">相册为空</p>`;
     state.shareMediaLoaded = true;
     updateShareMediaCount();
     return;
   }
   const hint = document.createElement("p");
-  hint.className = "muted";
+  hint.className = "muted share-month-head";
   hint.textContent = "按月加载最近相册（可滚动加载更多月份）";
   grid.appendChild(hint);
   let mi = 0;
-  const loadNextMonths = async (n = 3) => {
+  const loadNextMonths = async (n = 2) => {
     for (let i = 0; i < n && mi < months.length; i += 1, mi += 1) {
       const m = months[mi];
       const head = document.createElement("div");
@@ -3628,25 +5816,11 @@ async function loadShareMediaPicker() {
       grid.appendChild(head);
       let offset = 0;
       let hasMore = true;
-      while (hasMore && offset < 240) {
-        const page = await fetchMonthPhotos(m.month, offset, 80);
+      while (hasMore && offset < 160) {
+        const page = await fetchMonthPhotos(m.month, offset, 60);
         (page.photos || []).forEach((p) => {
-          const btn = document.createElement("button");
-          btn.type = "button";
-          btn.className =
-            "share-media-item" + (state.shareMediaPaths.has(p.path) ? " active" : "");
-          btn.dataset.path = p.path;
-          const title = (p.meta && p.meta.title) || p.name;
-          btn.innerHTML = `<img loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(
-            p.path
-          )}&size=160&_=${state.thumbBust || 0}" alt="" /><span>${escapeHtml(title)}</span>`;
-          btn.addEventListener("click", () => {
-            if (state.shareMediaPaths.has(p.path)) state.shareMediaPaths.delete(p.path);
-            else state.shareMediaPaths.add(p.path);
-            btn.classList.toggle("active", state.shareMediaPaths.has(p.path));
-            updateShareMediaCount();
-          });
-          grid.appendChild(btn);
+          state.shareMediaVisible.push(p);
+          appendShareMediaItem(grid, p);
         });
         hasMore = Boolean(page.has_more);
         offset = (page.offset || 0) + (page.photos || []).length;
@@ -3654,15 +5828,15 @@ async function loadShareMediaPicker() {
       }
     }
   };
-  await loadNextMonths(3);
+  await loadNextMonths(2);
   if (mi < months.length) {
     const more = document.createElement("button");
     more.type = "button";
-    more.className = "btn ghost";
+    more.className = "btn ghost share-month-head";
     more.textContent = "加载更多月份";
     more.addEventListener("click", async () => {
       more.disabled = true;
-      await loadNextMonths(3);
+      await loadNextMonths(2);
       more.disabled = false;
       if (mi >= months.length) more.remove();
     });
@@ -3675,6 +5849,68 @@ async function loadShareMediaPicker() {
 $("#btn-share-media-reload")?.addEventListener("click", () => {
   state.shareMediaLoaded = false;
   loadShareMediaPicker().catch((e) => alert(e.message || String(e)));
+});
+
+$("#btn-share-media-all")?.addEventListener("click", () => {
+  const paths = state.shareMediaVisible.map((p) => p.path).filter(Boolean);
+  if (!paths.length) return;
+  const allOn = paths.every((p) => state.shareMediaPaths.has(p));
+  shareSelectPaths(paths, !allOn);
+});
+
+async function runShareSearch(q) {
+  const grid = $("#share-search-grid");
+  const text = String(q || "").trim();
+  if (!grid) return;
+  if (!text) {
+    grid.innerHTML = `<p class="muted share-month-head">输入关键词后搜索</p>`;
+    state.shareSearchItems = [];
+    updateShareMediaCount();
+    return;
+  }
+  grid.innerHTML = `<p class="muted share-month-head">搜索中…</p>`;
+  const qs = new URLSearchParams({ q: text, limit: "120" });
+  const data = await api(`/api/search?${qs.toString()}`);
+  const items = data.items || [];
+  state.shareSearchItems = items;
+  grid.innerHTML = "";
+  if (!items.length) {
+    grid.innerHTML = `<p class="muted share-month-head">没有匹配「${escapeHtml(text)}」的内容</p>`;
+    updateShareMediaCount();
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "share-month-head muted";
+  head.textContent = `找到 ${data.total} 项，显示 ${items.length} 项`;
+  grid.appendChild(head);
+  items.forEach((p) => appendShareMediaItem(grid, p));
+  updateShareMediaCount();
+}
+
+function bindShareSearch() {
+  const run = () => {
+    runShareSearch($("#share-search-q")?.value || "").catch((err) => alert(err.message || err));
+  };
+  $("#btn-share-search")?.addEventListener("click", run);
+  $("#share-search-q")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      run();
+    }
+  });
+}
+bindShareSearch();
+$("#btn-share-search-all")?.addEventListener("click", () => {
+  shareSelectPaths(
+    state.shareSearchItems.map((p) => p.path),
+    true
+  );
+});
+$("#btn-share-search-clear")?.addEventListener("click", () => {
+  shareSelectPaths(
+    state.shareSearchItems.map((p) => p.path),
+    false
+  );
 });
 
 async function refreshIndexStatus() {
@@ -3732,7 +5968,7 @@ async function loadShares() {
       .filter(Boolean)
       .join(" · ");
     card.innerHTML = `
-      <img src="/api/shares/${it.id}/qr?t=${Date.now()}" alt="二维码" />
+      <img loading="lazy" decoding="async" src="/api/shares/${it.id}/qr" alt="二维码" />
       <div class="share-card-meta">
         <strong>${escapeAttr(it.label || "分享")}</strong>
         <p class="muted">${escapeAttr(flags)}</p>
@@ -3753,11 +5989,13 @@ $("#btn-share-create")?.addEventListener("click", async () => {
   const album_scopes =
     state.shareMode === "years" ? [...state.shareYears].sort() : [];
   const media_paths =
-    state.shareMode === "media" ? [...state.shareMediaPaths] : [];
+    state.shareMode === "years" ? [] : [...state.shareMediaPaths];
   if (!album_scopes.length && !media_paths.length) {
     if (msg) {
       msg.textContent =
-        state.shareMode === "media"
+        state.shareMode === "search"
+          ? "请先搜索并勾选图片或视频"
+          : state.shareMode === "media"
           ? "请至少勾选一张图片或视频"
           : "请至少选择一个年份相册";
     }
@@ -3851,6 +6089,7 @@ $("#btn-auth-setup")?.addEventListener("click", async () => {
 
 $("#btn-auth-pass")?.addEventListener("click", async () => {
   const msg = $("#auth-pass-msg");
+  const btn = $("#btn-auth-pass");
   const pw = $("#auth-new-pass")?.value || "";
   const pw2 = $("#auth-new-pass2")?.value || "";
   const checks = passwordChecks(pw, pw2);
@@ -3862,6 +6101,8 @@ $("#btn-auth-pass")?.addEventListener("click", async () => {
     if (msg) msg.textContent = "两次新密码不一致";
     return;
   }
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = "正在验证并保存…";
   try {
     const r = await api("/api/auth/password", {
       method: "POST",
@@ -3877,6 +6118,8 @@ $("#btn-auth-pass")?.addEventListener("click", async () => {
     });
   } catch (e) {
     if (msg) msg.textContent = e.message || String(e);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 });
 
@@ -3970,14 +6213,24 @@ function updateNarrationUI(data) {
   $("#btn-narration-rec")?.classList.remove("hidden");
   $("#btn-narration-stop")?.classList.add("hidden");
   if (!audio) return;
-  if (data && data.has_audio && data.audio_path) {
-    audio.src = `/api/file?path=${encodeURIComponent(data.audio_path)}&t=${Date.now()}`;
+  if (data && data.has_audio && (data.audio_path || data.has_audio)) {
     audio.classList.remove("hidden");
     btnDel?.classList.remove("hidden");
     const dur = data.audio_duration;
     status.textContent = dur
       ? `已有旁白，约 ${Number(dur).toFixed(1)} 秒`
       : "已有旁白";
+    const url = narrationFetchUrl(state.currentPath);
+    try {
+      audio.pause();
+    } catch (_) {}
+    if (audio._obj) {
+      try {
+        URL.revokeObjectURL(audio._obj);
+      } catch (_) {}
+      audio._obj = null;
+    }
+    audio.src = url;
   } else {
     audio.removeAttribute("src");
     audio.classList.add("hidden");
@@ -3985,6 +6238,16 @@ function updateNarrationUI(data) {
     if (status) status.textContent = "";
   }
 }
+
+$("#d-narration-audio")?.addEventListener("play", () => {
+  if (lb.playing) lbStopAutoplay();
+});
+
+window.addEventListener("pagehide", () => {
+  stopPreviewNarration();
+  if (lb.playing) lbStopAutoplay();
+  else lbStopNarration({ hard: true });
+});
 
 function stopNarrationMeter() {
   if (_narrationRaf) {
@@ -4086,56 +6349,160 @@ async function stopNarrationTracks() {
   }
 }
 
+function pickNarrationMime() {
+  const types = [
+    "audio/mp4",
+    "audio/aac",
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+  ];
+  try {
+    for (const t of types) {
+      if (MediaRecorder.isTypeSupported(t)) return t;
+    }
+  } catch (_) {}
+  return "";
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const s = String(fr.result || "");
+      const i = s.indexOf(",");
+      resolve(i >= 0 ? s.slice(i + 1) : s);
+    };
+    fr.onerror = () => reject(fr.error || new Error("读取录音失败"));
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function uploadNarrationBlob(path, blob, mime) {
+  const name = narrationFilename(mime);
+  const q = `/api/photo/audio?path=${encodeURIComponent(path)}`;
+  try {
+    const res = await fetch(q, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": mime || blob.type || "application/octet-stream",
+        "X-Narration-Filename": name,
+      },
+      body: blob,
+    });
+    if (res.ok) {
+      const ct = res.headers.get("content-type") || "";
+      if (ct.includes("application/json")) return res.json();
+      return { ok: true, has_audio: true, audio_path: true, message: "旁白已保存" };
+    }
+    let msg = res.statusText;
+    try {
+      const j = await res.json();
+      msg = j.detail || JSON.stringify(j);
+    } catch (_) {}
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  } catch (e) {
+    const data_b64 = await blobToBase64(blob);
+    if (!data_b64) throw e;
+    return await api(q, {
+      method: "POST",
+      body: JSON.stringify({ filename: name, mime: mime || "", data_b64 }),
+    });
+  }
+}
+
+function narrationFilename(mime) {
+  const t = String(mime || "").toLowerCase();
+  if (t.includes("mp4") || t.includes("aac") || t.includes("m4a")) return "narration.m4a";
+  if (t.includes("mpeg") || t.includes("mp3")) return "narration.mp3";
+  if (t.includes("ogg")) return "narration.ogg";
+  return "narration.webm";
+}
+
+function narrationMicError(e) {
+  const name = e && (e.name || e.code);
+  const msg = String((e && e.message) || e || "");
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+    return "未获得麦克风权限。请在系统设置里允许当前浏览器使用麦克风，并在弹出框点「允许」。";
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return "没有找到麦克风";
+  }
+  if (name === "NotReadableError" || name === "TrackStartError") {
+    return "麦克风被其它应用占用，请关掉通话/录音后再试";
+  }
+  if (name === "SecurityError") {
+    return "当前页面未视为安全环境，请用 https 打开并信任证书后再录音";
+  }
+  return msg || "无法打开麦克风";
+}
+
 $("#btn-narration-rec")?.addEventListener("click", async () => {
   const status = $("#narration-status");
   if (!state.currentPath || state.mediaKind === "video") return;
-  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-    alert("当前浏览器不支持录音");
+  const gum = navigator.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices);
+  if (!gum || typeof MediaRecorder === "undefined") {
+    alert("当前浏览器不支持录音。iPhone 请用 Safari，并允许麦克风。");
     return;
   }
   try {
     _narrationChunks = [];
-    _narrationStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : MediaRecorder.isTypeSupported("audio/webm")
-        ? "audio/webm"
-        : "";
-    _narrationRecorder = mime
-      ? new MediaRecorder(_narrationStream, { mimeType: mime })
-      : new MediaRecorder(_narrationStream);
+    const constraints = {
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    };
+    try {
+      _narrationStream = await gum(constraints);
+    } catch (_) {
+      _narrationStream = await gum({ audio: true });
+    }
+    const mime = pickNarrationMime();
+    try {
+      _narrationRecorder = mime
+        ? new MediaRecorder(_narrationStream, { mimeType: mime })
+        : new MediaRecorder(_narrationStream);
+    } catch (_) {
+      _narrationRecorder = new MediaRecorder(_narrationStream);
+    }
     _narrationRecorder.ondataavailable = (e) => {
       if (e.data && e.data.size) _narrationChunks.push(e.data);
     };
-    _narrationRecorder.onstop = async () => {
-      await stopNarrationTracks();
-      const type = _narrationRecorder?.mimeType || "audio/webm";
-      const blob = new Blob(_narrationChunks, { type });
-      _narrationChunks = [];
+    _narrationRecorder.onstop = () => {
+      const rec = _narrationRecorder;
+      const type = rec?.mimeType || mime || "audio/webm";
       _narrationRecorder = null;
-      $("#narration-block")?.classList.remove("is-recording");
-      $("#narration-meter")?.classList.add("hidden");
-      $("#btn-narration-rec")?.classList.remove("hidden");
-      $("#btn-narration-stop")?.classList.add("hidden");
-      if (!blob.size) {
-        if (status) status.textContent = "没有录到声音";
-        return;
-      }
-      try {
-        if (status) status.textContent = "正在保存旁白…";
-        const fd = new FormData();
-        fd.append("file", blob, "narration.webm");
-        const r = await api(
-          `/api/photo/audio?path=${encodeURIComponent(state.currentPath)}`,
-          { method: "POST", body: fd }
-        );
-        updateNarrationUI(r);
-        if (status) status.textContent = r.message || "旁白已保存";
-      } catch (e) {
-        if (status) status.textContent = e.message || String(e);
-      }
+      window.setTimeout(async () => {
+        const blob = new Blob(_narrationChunks, { type: type || "application/octet-stream" });
+        _narrationChunks = [];
+        await stopNarrationTracks();
+        $("#narration-block")?.classList.remove("is-recording");
+        $("#narration-meter")?.classList.add("hidden");
+        $("#btn-narration-rec")?.classList.remove("hidden");
+        $("#btn-narration-stop")?.classList.add("hidden");
+        if (!blob.size) {
+          if (status) status.textContent = "没有录到声音，请多录一两秒再保存";
+          return;
+        }
+        try {
+          if (status) status.textContent = "正在保存旁白…";
+          const r = await uploadNarrationBlob(state.currentPath, blob, type);
+          updateNarrationUI(r);
+          if (status) status.textContent = r.message || "旁白已保存";
+        } catch (err) {
+          if (status) status.textContent = "保存失败：" + (err.message || String(err));
+        }
+      }, 180);
     };
-    _narrationRecorder.start();
+    try {
+      _narrationRecorder.start(1000);
+    } catch (_) {
+      _narrationRecorder.start();
+    }
     startNarrationMeter(_narrationStream);
     $("#narration-block")?.classList.add("is-recording");
     $("#btn-narration-rec")?.classList.add("hidden");
@@ -4143,14 +6510,19 @@ $("#btn-narration-rec")?.addEventListener("click", async () => {
     if (status) status.textContent = "录音中…点击「停止并保存」结束";
   } catch (e) {
     await stopNarrationTracks();
-    if (status) status.textContent = e.message || "无法打开麦克风";
+    if (status) status.textContent = narrationMicError(e);
   }
 });
 
 $("#btn-narration-stop")?.addEventListener("click", () => {
-  if (_narrationRecorder && _narrationRecorder.state !== "inactive") {
-    _narrationRecorder.stop();
-  }
+  const rec = _narrationRecorder;
+  if (!rec || rec.state === "inactive") return;
+  try {
+    rec.requestData();
+  } catch (_) {}
+  try {
+    rec.stop();
+  } catch (_) {}
 });
 
 $("#btn-narration-del")?.addEventListener("click", async () => {
@@ -4356,18 +6728,44 @@ $("#btn-thumb-root-apply")?.addEventListener("click", () => {
 function _visitorTable(headers, rows) {
   if (!rows.length) return '<p class="muted">暂无数据</p>';
   const th = headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("");
-  const tr = rows
-    .map(
-      (cells) =>
-        `<tr>${cells.map((c) => `<td>${c}</td>`).join("")}</tr>`
-    )
-    .join("");
+  const td = (c) => {
+    if (c && typeof c === "object") {
+      const cls = c.action ? "visitor-td-action" : "visitor-td-ellipsis";
+      const title =
+        c.title != null
+          ? ` title="${escapeAttr(c.title)}" data-full="${escapeAttr(c.title)}"`
+          : "";
+      return `<td class="${cls}"${title}>${c.html != null ? c.html : escapeHtml(c.text || "")}</td>`;
+    }
+    const s = String(c ?? "");
+    if (s.includes("<button")) return `<td class="visitor-td-action">${s}</td>`;
+    const plain = s.replace(/<[^>]*>/g, "");
+    return `<td class="visitor-td-ellipsis" title="${escapeAttr(plain)}" data-full="${escapeAttr(plain)}">${s}</td>`;
+  };
+  const tr = rows.map((cells) => `<tr>${cells.map(td).join("")}</tr>`).join("");
   return `<table class="visitor-table"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+}
+
+function bindVisitorExpand() {
+  const root = $("#manage-visitors");
+  if (!root || root.dataset.expandBound === "1") return;
+  root.dataset.expandBound = "1";
+  root.addEventListener("click", (e) => {
+    if (e.target.closest("button, a, input, select, .btn")) return;
+    const el = e.target.closest(
+      ".visitor-td-ellipsis, .visitor-summary-note, .visitor-pie-legend-text, .visitor-stat strong"
+    );
+    if (!el) return;
+    const willOpen = !el.classList.contains("is-open");
+    root.querySelectorAll(".is-open").forEach((n) => n.classList.remove("is-open"));
+    if (willOpen) el.classList.add("is-open");
+  });
 }
 
 async function loadVisitorStats() {
   const box = $("#manage-visitors") || $("#visitors-page");
   if (!box || box.classList.contains("hidden")) return;
+  bindVisitorExpand();
   const msg = $("#visitor-msg");
   try {
     const [sum, cur, hist, curve, hot, bl, uploadStats, uploads] = await Promise.all([
@@ -4382,9 +6780,24 @@ async function loadVisitorStats() {
     ]);
     const sumEl = $("#visitor-summary");
     if (sumEl) {
-      sumEl.textContent =
-        `总访问 ${sum.total_visits || 0} · 独立 IP ${sum.unique_ips || 0} · 今日 ${sum.today_visits || 0} · 入库 ${sum.ingest_count || uploadStats.total || 0} · 黑名单 ${sum.blacklist_count || 0}\n` +
-        (sum.mac_note || "");
+      const stats = [
+        ["总访问", sum.total_visits || 0],
+        ["独立 IP", sum.unique_ips || 0],
+        ["今日", sum.today_visits || 0],
+        ["入库", sum.ingest_count || uploadStats.total || 0],
+        ["黑名单", sum.blacklist_count || 0],
+      ];
+      sumEl.className = "visitor-summary";
+      sumEl.innerHTML =
+        stats
+          .map(
+            ([k, v]) =>
+              `<span class="visitor-stat"><em>${escapeHtml(String(k))}</em><strong>${escapeHtml(String(v))}</strong></span>`
+          )
+          .join("") +
+        (sum.mac_note
+          ? `<p class="muted visitor-summary-note">${escapeHtml(sum.mac_note)}</p>`
+          : "");
     }
     const pieEl = $("#visitor-upload-pie");
     const legendEl = $("#visitor-upload-legend");
@@ -4475,6 +6888,24 @@ const UPLOAD_PIE_COLORS = [
   "#d81159",
 ];
 
+function smoothCurvePath(xy) {
+  if (!xy.length) return "";
+  if (xy.length === 1) return `M${xy[0].x.toFixed(1)},${xy[0].y.toFixed(1)}`;
+  let d = `M${xy[0].x.toFixed(1)},${xy[0].y.toFixed(1)}`;
+  for (let i = 0; i < xy.length - 1; i += 1) {
+    const p0 = xy[i - 1] || xy[i];
+    const p1 = xy[i];
+    const p2 = xy[i + 1];
+    const p3 = xy[i + 2] || p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+  }
+  return d;
+}
+
 function renderUploadPie(el, legendEl, items, total) {
   if (!el) return;
   if (!items.length || !total) {
@@ -4482,51 +6913,69 @@ function renderUploadPie(el, legendEl, items, total) {
     if (legendEl) legendEl.innerHTML = "";
     return;
   }
-  const R = 72;
+  const R = 74;
+  const r = 46;
   const cx = 90;
   const cy = 90;
   let angle = -Math.PI / 2;
   const slices = [];
   items.forEach((it, i) => {
     const frac = (Number(it.count) || 0) / total;
-    const sweep = frac * Math.PI * 2;
+    const sweep = Math.max(0.001, frac * Math.PI * 2);
     const a0 = angle;
     const a1 = angle + sweep;
     angle = a1;
-    const x0 = cx + R * Math.cos(a0);
-    const y0 = cy + R * Math.sin(a0);
-    const x1 = cx + R * Math.cos(a1);
-    const y1 = cy + R * Math.sin(a1);
     const large = sweep > Math.PI ? 1 : 0;
+    const x0o = cx + R * Math.cos(a0);
+    const y0o = cy + R * Math.sin(a0);
+    const x1o = cx + R * Math.cos(a1);
+    const y1o = cy + R * Math.sin(a1);
+    const x0i = cx + r * Math.cos(a1);
+    const y0i = cy + r * Math.sin(a1);
+    const x1i = cx + r * Math.cos(a0);
+    const y1i = cy + r * Math.sin(a0);
     const color = UPLOAD_PIE_COLORS[i % UPLOAD_PIE_COLORS.length];
     const d =
       frac >= 0.999
-        ? `M ${cx} ${cy - R} A ${R} ${R} 0 1 1 ${cx - 0.01} ${cy - R} Z`
-        : `M ${cx} ${cy} L ${x0} ${y0} A ${R} ${R} 0 ${large} 1 ${x1} ${y1} Z`;
+        ? `M ${cx} ${cy - R} A ${R} ${R} 0 1 1 ${cx - 0.01} ${cy - R} L ${cx - 0.01} ${cy - r} A ${r} ${r} 0 1 0 ${cx} ${cy - r} Z`
+        : `M ${x0o.toFixed(2)} ${y0o.toFixed(2)} A ${R} ${R} 0 ${large} 1 ${x1o.toFixed(2)} ${y1o.toFixed(2)} L ${x0i.toFixed(2)} ${y0i.toFixed(2)} A ${r} ${r} 0 ${large} 0 ${x1i.toFixed(2)} ${y1i.toFixed(2)} Z`;
     slices.push(
-      `<path d="${d}" fill="${color}" stroke="var(--bg, #fff)" stroke-width="1.5"><title>${escapeHtml(
+      `<path class="visitor-pie-slice" d="${d}" fill="${color}"><title>${escapeHtml(
         it.label || ""
       )}: ${it.count}（${it.share}%）</title></path>`
     );
   });
-  el.innerHTML = `<svg class="visitor-pie-svg" viewBox="0 0 180 180" role="img" aria-label="入库占比">${slices.join(
-    ""
-  )}</svg>`;
+  el.innerHTML = `<svg class="visitor-pie-svg" viewBox="0 0 180 180" role="img" aria-label="入库占比">
+    <defs>
+      <filter id="pie-soft" x="-20%" y="-20%" width="140%" height="140%">
+        <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="rgba(14,159,191,0.22)"/>
+      </filter>
+    </defs>
+    <circle cx="${cx}" cy="${cy}" r="${R + 6}" class="visitor-pie-halo" />
+    <g filter="url(#pie-soft)">${slices.join("")}</g>
+    <circle cx="${cx}" cy="${cy}" r="${r - 1}" class="visitor-pie-hole" />
+    <text class="visitor-pie-center-num" x="${cx}" y="${cy - 4}" text-anchor="middle">${total}</text>
+    <text class="visitor-pie-center-cap" x="${cx}" y="${cy + 14}" text-anchor="middle">项入库</text>
+  </svg>`;
   if (legendEl) {
     legendEl.innerHTML = items
       .map((it, i) => {
         const color = UPLOAD_PIE_COLORS[i % UPLOAD_PIE_COLORS.length];
-        return `<div class="visitor-pie-legend-row"><span class="visitor-pie-swatch" style="background:${color}"></span><span>${escapeHtml(
-          it.label || "未知"
-        )} · <strong>${it.count}</strong> 项（${it.share}%）${
-          it.video_count ? ` · 视频 ${it.video_count}` : ""
-        }</span></div>`;
+        const share = Math.max(0, Math.min(100, Number(it.share) || 0));
+        return `<div class="visitor-pie-legend-row">
+          <span class="visitor-pie-swatch" style="background:${color}"></span>
+          <span class="visitor-pie-legend-text" title="${escapeAttr(`${it.label || "未知"} · ${it.count} 项（${share}%）`)}">${escapeHtml(
+            it.label || "未知"
+          )}</span>
+          <span class="visitor-pie-legend-num">${it.count} · ${share}%</span>
+          <i class="visitor-pie-legend-bar"><b style="width:${share}%;background:${color}"></b></i>
+        </div>`;
       })
       .join("");
   }
 }
 
-/** 近 N 天访问曲线：SVG 折线+柱，避免旧柱状图看不见 */
+/** 近 N 天访问：平滑曲线 + 渐变面积 */
 function renderVisitorCurve(el, rawPts) {
   const pts = Array.isArray(rawPts) ? rawPts : [];
   if (!pts.length) {
@@ -4534,12 +6983,12 @@ function renderVisitorCurve(el, rawPts) {
     return;
   }
   const maxV = Math.max(...pts.map((p) => Number(p.visits) || 0), 1);
-  const w = Math.max(420, pts.length * 40);
-  const h = 240;
-  const padL = 34;
-  const padR = 12;
-  const padT = 18;
-  const padB = 34;
+  const w = Math.max(520, pts.length * 36);
+  const h = 248;
+  const padL = 36;
+  const padR = 16;
+  const padT = 22;
+  const padB = 36;
   const chartW = w - padL - padR;
   const chartH = h - padT - padB;
   const n = pts.length;
@@ -4550,39 +6999,47 @@ function renderVisitorCurve(el, rawPts) {
     const y = padT + chartH - (v / maxV) * chartH;
     return { x, y, v, day: String(p.day || ""), visitors: Number(p.visitors) || 0 };
   });
-  const line = xy.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
-  const area =
-    `M${xy[0].x.toFixed(1)},${(padT + chartH).toFixed(1)} ` +
-    xy.map((p) => `L${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ") +
-    ` L${xy[xy.length - 1].x.toFixed(1)},${(padT + chartH).toFixed(1)} Z`;
-  const bars = xy
-    .map((p) => {
-      const bw = Math.max(6, Math.min(16, (chartW / Math.max(n, 1)) * 0.42));
-      const bh = Math.max(p.v > 0 ? 4 : 0, padT + chartH - p.y);
-      return `<rect class="visitor-curve-bar" x="${(p.x - bw / 2).toFixed(1)}" y="${p.y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="2"><title>${escapeHtml(p.day)}：${p.v} 次 / ${p.visitors} IP</title></rect>`;
-    })
-    .join("");
+  const line = smoothCurvePath(xy);
+  const base = padT + chartH;
+  const areaPath =
+    `${line} L${xy[xy.length - 1].x.toFixed(1)},${base.toFixed(1)} L${xy[0].x.toFixed(1)},${base.toFixed(1)} Z`;
   const labels = xy
     .map((p, i) => {
-      if (n > 12 && i % 2 === 1 && i !== n - 1) return "";
+      if (n > 10 && i % 2 === 1 && i !== n - 1 && i !== 0) return "";
       const label = p.day.slice(5) || p.day;
-      return `<text class="visitor-curve-label" x="${p.x.toFixed(1)}" y="${h - 8}" text-anchor="middle">${escapeHtml(label)}</text>`;
+      return `<text class="visitor-curve-label" x="${p.x.toFixed(1)}" y="${h - 10}" text-anchor="middle">${escapeHtml(label)}</text>`;
     })
     .join("");
   const yTicks = [0, Math.round(maxV / 2), maxV]
     .filter((v, i, a) => a.indexOf(v) === i)
     .map((v) => {
       const y = padT + chartH - (v / maxV) * chartH;
-      return `<text class="visitor-curve-ytick" x="${padL - 6}" y="${y + 3}" text-anchor="end">${v}</text><line class="visitor-curve-grid" x1="${padL}" x2="${w - padR}" y1="${y}" y2="${y}" />`;
+      return `<text class="visitor-curve-ytick" x="${padL - 8}" y="${y + 3}" text-anchor="end">${v}</text><line class="visitor-curve-grid" x1="${padL}" x2="${w - padR}" y1="${y}" y2="${y}" />`;
     })
     .join("");
   const dots = xy
     .map(
       (p) =>
-        `<circle class="visitor-curve-dot" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.5"><title>${escapeHtml(p.day)}：${p.v} 次</title></circle>`
+        `<circle class="visitor-curve-dot-halo" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="7"/><circle class="visitor-curve-dot" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.2"><title>${escapeHtml(p.day)}：${p.v} 次 / ${p.visitors} IP</title></circle>`
     )
     .join("");
-  el.innerHTML = `<svg class="visitor-curve-svg" viewBox="0 0 ${w} ${h}" role="img" aria-label="近 ${n} 天访问曲线">${yTicks}<path class="visitor-curve-area" d="${area}" /><path class="visitor-curve-line" d="${line}" fill="none" />${bars}${dots}${labels}</svg><p class="muted visitor-curve-cap">峰值 ${maxV} 次/天 · 共 ${n} 天</p>`;
+  el.innerHTML = `<svg class="visitor-curve-svg" viewBox="0 0 ${w} ${h}" role="img" aria-label="近 ${n} 天访问曲线">
+    <defs>
+      <linearGradient id="curve-fill" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--leaf, #0e9fbf)" stop-opacity="0.38"/>
+        <stop offset="100%" stop-color="var(--leaf, #0e9fbf)" stop-opacity="0.02"/>
+      </linearGradient>
+      <linearGradient id="curve-stroke" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#5eead4"/>
+        <stop offset="55%" stop-color="var(--leaf, #0e9fbf)"/>
+        <stop offset="100%" stop-color="#3d7dff"/>
+      </linearGradient>
+    </defs>
+    ${yTicks}
+    <path class="visitor-curve-area" d="${areaPath}" fill="url(#curve-fill)" />
+    <path class="visitor-curve-line" d="${line}" />
+    ${dots}${labels}
+  </svg><p class="muted visitor-curve-cap">峰值 ${maxV} 次/天 · 共 ${n} 天</p>`;
 }
 
 $("#btn-visitors-refresh")?.addEventListener("click", () => {
@@ -4870,8 +7327,12 @@ function renderTrash(items) {
     const shot = formatTrashTime(it.media_datetime);
     card.innerHTML = `
       <span class="photo-check" aria-hidden="true"></span>
-      ${isVid ? `<span class="media-badge" aria-hidden="true">▶</span>` : ""}
-      <img loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(it.path)}&size=320&_=${state.thumbBust || 0}" alt="" />
+      ${
+        isVid
+          ? `<span class="media-badge media-badge-video" aria-hidden="true">视频</span>`
+          : `<span class="media-badge media-badge-image" aria-hidden="true">照片</span>`
+      }
+      <img loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(it.path)}&size=${albumThumbSize()}&_=${state.thumbBust || 0}" alt="" />
       <span class="trash-card-title">${escapeAttr(title)}</span>
       <span class="trash-card-meta muted">删于 ${escapeAttr(deleted)}</span>
       <span class="trash-card-meta muted">拍摄 ${escapeAttr(shot)}</span>`;
@@ -4988,70 +7449,52 @@ $("#btn-trash-purge")?.addEventListener("click", async () => {
 });
 
 
-/* —— 搜索 —— */
+/* —— 搜索模式 —— */
 async function runSearch(q) {
-  const root = $("#search-root");
-  if (!root) return;
+  const results = $("#search-results") || $("#search-root");
+  if (!results) return;
   const text = (q || "").trim();
   if (!text) {
     clearSearch();
     return;
   }
-  root.classList.remove("hidden");
-  root.innerHTML = `<p class="muted">搜索中…</p>`;
+  if (state.viewMode !== "search") {
+    state.viewMode = "search";
+    localStorage.setItem("xiaoshu_view", "search");
+    applyViewMode();
+  }
+  const box = $("#search-results") || results;
+  box.innerHTML = `<p class="muted">正在从索引库搜索…</p>`;
   $("#btn-search-clear")?.classList.remove("hidden");
-  // 隐藏常规浏览根
-  $("#journey-root")?.classList.add("hidden");
-  $("#classic-root")?.classList.add("hidden");
-  $("#map-root")?.classList.add("hidden");
-  $("#browse-empty")?.classList.add("hidden");
-  const data = await api(`/api/search?q=${encodeURIComponent(text)}&limit=80`);
+  const kind = mediaKindQuery();
+  const qs = new URLSearchParams({ q: text, limit: "80" });
+  if (kind) qs.set("kind", kind);
+  const data = await api(`/api/search?${qs.toString()}`);
   const items = data.items || [];
   if (!items.length) {
-    root.innerHTML = `<p class="empty">没有匹配「${escapeHtml(text)}」的结果</p>`;
+    const kindLabel = kind === "video" ? "视频" : kind === "image" ? "照片" : "内容";
+    box.innerHTML = `<p class="empty">没有匹配「${escapeHtml(text)}」的${kindLabel}</p>`;
     return;
   }
   const paths = items.map((x) => x.path);
-  root.innerHTML = `<div class="search-head"><strong>找到 ${data.total} 项</strong><span class="muted">显示 ${items.length} 项</span></div>
+  const kindHint =
+    kind === "video" ? "（仅视频）" : kind === "image" ? "（仅照片）" : "（照片+视频）";
+  box.innerHTML = `<div class="search-head"><strong>找到 ${data.total} 项</strong><span class="muted">显示 ${items.length} 项 ${kindHint}</span></div>
     <div class="photo-grid search-grid" id="search-grid"></div>`;
   const grid = $("#search-grid");
   items.forEach((p) => {
     grid.appendChild(makePhotoCard(p, paths));
   });
+  bindAlbumThumbLazy(grid);
 }
 
 function clearSearch() {
-  const root = $("#search-root");
-  root?.classList.add("hidden");
-  if (root) root.innerHTML = "";
+  const box = $("#search-results");
+  if (box) box.innerHTML = "";
   $("#btn-search-clear")?.classList.add("hidden");
-  $("#search-q").value = "";
-  // 恢复当前浏览模式
-  const view = state.view || "journey";
-  $("#journey-root")?.classList.toggle("hidden", view !== "journey");
-  $("#classic-root")?.classList.toggle("hidden", view !== "classic");
-  $("#map-root")?.classList.toggle("hidden", view !== "map");
+  if ($("#search-q")) $("#search-q").value = "";
 }
 
-function setSearchOpen(open) {
-  const bar = $("#search-bar");
-  const btn = $("#btn-search-toggle");
-  if (!bar) return;
-  bar.classList.toggle("hidden", !open);
-  btn?.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    setTimeout(() => $("#search-q")?.focus(), 30);
-  }
-}
-
-$("#btn-search-toggle")?.addEventListener("click", () => {
-  const bar = $("#search-bar");
-  const open = bar?.classList.contains("hidden");
-  setSearchOpen(Boolean(open));
-});
-$("#btn-search-close")?.addEventListener("click", () => {
-  setSearchOpen(false);
-});
 $("#search-bar")?.addEventListener("submit", (e) => {
   e.preventDefault();
   runSearch($("#search-q")?.value || "").catch((err) => alert(err.message || err));
@@ -5059,12 +7502,12 @@ $("#search-bar")?.addEventListener("submit", (e) => {
 $("#btn-search-clear")?.addEventListener("click", () => clearSearch());
 
 /* —— 存储看板 —— */
-async function loadStorage() {
+async function loadStorage(force = false) {
   const cards = $("#storage-cards");
   const msg = $("#storage-msg");
   if (!cards) return;
   cards.innerHTML = `<p class="muted">加载中…</p>`;
-  const data = await api("/api/storage");
+  const data = await api(`/api/storage${force ? "?force=1" : ""}`);
   const b = data.bytes || {};
   const d = data.disk || {};
   const c = data.counts || {};
@@ -5083,10 +7526,18 @@ async function loadStorage() {
     <div class="storage-card"><div class="storage-label">离线地图包</div><div class="storage-value">${formatBytes(b.map_pack)}</div></div>
     <div class="storage-card"><div class="storage-label">data 合计</div><div class="storage-value">${formatBytes(b.data)}</div></div>
   `;
-  if (msg) msg.textContent = "";
+  if (msg) {
+    const hc = data.content_hash || {};
+    const bits = [];
+    if (hc.total) {
+      bits.push(`内容指纹 ${hc.hashed || 0}/${hc.total}` + (hc.missing ? `（缺 ${hc.missing}）` : "（齐全）"));
+    }
+    if (data.cached) bits.push("占用已缓存");
+    msg.textContent = bits.join(" · ");
+  }
   const dedup = $("#dedup-root");
   if (dedup && !dedup.dataset.loaded) {
-    dedup.innerHTML = `<p class="muted">点「检查重复项」扫描内容指纹并列出可处理的重复组。</p>`;
+    dedup.innerHTML = `<p class="muted">点「检查重复项」：按去掉元数据后的内容指纹比对（同画面、不同 EXIF 也算重复）。升级后首次会重算库内指纹。</p>`;
   }
 }
 
@@ -5094,30 +7545,46 @@ async function checkAndLoadDedup() {
   const root = $("#dedup-root");
   const msg = $("#storage-msg");
   if (!root) return;
-  root.innerHTML = `<p class="muted">正在补算指纹并检查重复…</p>`;
-  if (msg) msg.textContent = "扫描中…";
+  root.innerHTML = `<p class="muted">正在从数据库比对内容指纹（已忽略元数据）…</p>`;
+  if (msg) msg.textContent = "查库中…";
   try {
-    const scan = await api("/api/dedup/scan", { method: "POST", body: "{}" });
-    if (msg) msg.textContent = scan.message || "指纹已更新";
+    let data = await api("/api/dedup?limit=100");
+    const missing = Number(data.missing || 0);
+    const needsRehash = !!data.needs_rehash;
+    if (missing > 0 || needsRehash) {
+      const hint = needsRehash
+        ? "正在按去元数据内容重算全部指纹，大库可能较久…"
+        : `有 ${missing} 条缺指纹，正在补算…`;
+      if (msg) msg.textContent = hint;
+      root.innerHTML = `<p class="muted">${hint}</p>`;
+      const scan = await api("/api/dedup/scan", { method: "POST", body: "{}" });
+      if (msg) msg.textContent = scan.message || "指纹已更新";
+      data = await api("/api/dedup?limit=100");
+    } else {
+      const hashed = data.hashed ?? data.total ?? 0;
+      const total = data.total ?? hashed;
+      if (msg) msg.textContent = `已用去元数据内容指纹比对（${hashed}/${total}）`;
+    }
+    renderDedupList(data);
   } catch (e) {
     if (msg) msg.textContent = e.message || String(e);
+    root.innerHTML = `<p class="empty">${escapeHtml(e.message || String(e))}</p>`;
   }
-  await loadDedupList();
 }
 
-async function loadDedupList() {
+function renderDedupList(data) {
   const root = $("#dedup-root");
   if (!root) return;
   root.dataset.loaded = "1";
-  root.innerHTML = `<p class="muted">加载重复项…</p>`;
-  const data = await api("/api/dedup?limit=100");
   const groups = data.groups || [];
   if (!groups.length) {
-    root.innerHTML = `<p class="empty">未发现内容重复。入库时相同文件会自动跳过；也可点「检查重复项」再扫一次。</p>`;
+    const hashed = data.hashed ?? "—";
+    const total = data.total ?? "—";
+    root.innerHTML = `<p class="empty">未发现内容重复（指纹 ${hashed}/${total}）。入库时相同文件会自动跳过。</p>`;
     return;
   }
   root.innerHTML =
-    `<div class="search-head"><strong>发现 ${groups.length} 组重复</strong><span class="muted">勾选要保留的一份，其余移入回收站</span></div>` +
+    `<div class="search-head"><strong>发现 ${groups.length} 组重复</strong><span class="muted">勾选要保留的一份，其余移入回收站 · 指纹 ${data.hashed ?? "—"}/${data.total ?? "—"}</span></div>` +
     groups
       .map((g, gi) => {
         const items = g.items || [];
@@ -5141,6 +7608,14 @@ async function loadDedupList() {
         </details>`;
       })
       .join("");
+}
+
+async function loadDedupList() {
+  const root = $("#dedup-root");
+  if (!root) return;
+  root.innerHTML = `<p class="muted">加载重复项…</p>`;
+  const data = await api("/api/dedup?limit=100");
+  renderDedupList(data);
 }
 
 async function resolveDedupGroup(groupEl) {
@@ -5182,7 +7657,7 @@ $("#dedup-root")?.addEventListener("click", (e) => {
   }
 });
 
-$("#btn-storage-refresh")?.addEventListener("click", () => loadStorage().catch((e) => alert(e.message)));
+$("#btn-storage-refresh")?.addEventListener("click", () => loadStorage(true).catch((e) => alert(e.message)));
 $("#btn-dedup-check")?.addEventListener("click", () => checkAndLoadDedup().catch((e) => alert(e.message)));
 async function resolveAllDedup(strategy) {
   const label = strategy === "newest" ? "每组保留拍摄时间最新的一份" : "每组保留拍摄时间最早的一份";
@@ -5190,7 +7665,10 @@ async function resolveAllDedup(strategy) {
   const msg = $("#storage-msg");
   if (msg) msg.textContent = "处理中…";
   try {
-    await api("/api/dedup/scan", { method: "POST", body: "{}" });
+    const preview = await api("/api/dedup?limit=1");
+    if (Number(preview.missing || 0) > 0) {
+      await api("/api/dedup/scan", { method: "POST", body: "{}" });
+    }
     const r = await api("/api/dedup/resolve-all", {
       method: "POST",
       body: JSON.stringify({ strategy }),
@@ -5246,7 +7724,7 @@ async function lbToggleLive() {
     $("#lb-live").textContent = "实况";
     return;
   }
-  const url = `/api/file?path=${encodeURIComponent(lbLivePath)}&t=${Date.now()}`;
+  const url = mediaPlayUrl(lbLivePath);
   lbLiveVideo.src = url;
   lbLiveVideo.classList.remove("hidden");
   lbImg?.classList.add("hidden");
@@ -5283,6 +7761,9 @@ lbViewport?.addEventListener("pointerdown", (e) => {
 
 /* Boot */
 setupImportMobileUX();
+wireUploadQueueControls();
+wireUploadHist();
+wireMediaKindFilter();
 
 async function bootAuthAndUi() {
   const params = new URLSearchParams(location.search);
