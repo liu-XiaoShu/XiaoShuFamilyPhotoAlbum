@@ -9,10 +9,10 @@
   <img alt="version" src="https://img.shields.io/badge/version-v3.0.0-0e9fbf?style=flat-square" />
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square" />
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20Raspberry%20Pi-informational?style=flat-square" />
-  <img alt="license" src="https://img.shields.io/badge/license-personal%20use-lightgrey?style=flat-square" />
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
 </p>
 
-**作者：** xiaoshu · **版本：** v3.0.0（更新时间 2026-10-05）
+**作者：** xiaoshu · **邮箱：** [liu_xiaoshu@163.com](mailto:liu_xiaoshu@163.com) · **版本：** v3.0.0（更新时间 2026-10-05）
 
 把照片和视频按时间整理到本机目录，在浏览器里浏览、编辑、下载，并通过二维码在局域网内分享给家人。适合树莓派 / NAS 一类常开小主机。
 
@@ -161,9 +161,11 @@ xiaoshu-album/
 
 ## 许可证
 
-作者 **xiaoshu** · 版本 **v3.0.0** · 更新时间 **2026-10-05**  
+本项目采用 [MIT License](./LICENSE)。
 
-默认按个人/家庭自用分发。若对外开源，请自行补充 `LICENSE` 文件。
+Copyright (c) 2026 xiaoshu <liu_xiaoshu@163.com>
+
+作者 **xiaoshu** · 版本 **v3.0.0** · 更新时间 **2026-10-05**
 
 ---
 
