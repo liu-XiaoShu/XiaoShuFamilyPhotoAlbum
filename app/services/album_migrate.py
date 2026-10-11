@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import time
 from pathlib import Path
 
 from ..config import ROOT
@@ -183,21 +182,11 @@ def migrate_album_root(old_raw: str | Path, new_raw: str | Path) -> dict:
     }
 
 
-_thumb_stats_cache: dict = {"path": "", "ts": 0.0, "data": None}
-
-
 def thumb_dir_stats(root: Path) -> dict:
-    """统计缩略图目录文件数与占用。结果缓存约 90 秒，避免设置页反复扫盘。"""
+    """统计缩略图目录文件数与占用。"""
     root = resolve_album_path(root) if str(root) else Path()
-    now = time.time()
-    key = str(root)
-    hit = _thumb_stats_cache
-    if hit.get("data") is not None and hit.get("path") == key and now - float(hit.get("ts") or 0) < 90:
-        return dict(hit["data"])
     if not root.exists() or not root.is_dir():
-        data = {"path": str(root), "count": 0, "bytes": 0}
-        _thumb_stats_cache.update({"path": key, "ts": now, "data": data})
-        return data
+        return {"path": str(root), "count": 0, "bytes": 0}
     count = 0
     total = 0
     try:
@@ -210,9 +199,7 @@ def thumb_dir_stats(root: Path) -> dict:
                     pass
     except OSError:
         pass
-    data = {"path": str(root), "count": count, "bytes": total}
-    _thumb_stats_cache.update({"path": key, "ts": now, "data": data})
-    return data
+    return {"path": str(root), "count": count, "bytes": total}
 
 
 def validate_new_thumb_root(old: Path, new: Path) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 import piexif
 from PIL import Image, PngImagePlugin
 
-from .naming import guess_datetime_from_name, parse_datetime, parse_title_from_filename
+from .naming import guess_datetime_from_name, parse_title_from_filename
 
 REFLECTION_MARK = "---感悟---"
 XMP_NS = "xiaoshu"
@@ -119,7 +119,7 @@ def _exif_to_iso(value: bytes | str | None) -> str | None:
             )
         except ValueError:
             continue
-    return None
+    return text
 
 
 def _split_description(raw: str | None) -> tuple[str | None, str | None]:
@@ -266,8 +266,8 @@ def read_meta(path: Path) -> PhotoMeta:
 
     # JPEG/JPG：优先 piexif 快路径，跳过 Image.open 像素解码
     if suffix in {".jpg", ".jpeg"} and _read_jpeg_exif_fast(path, meta):
-        if not parse_datetime(meta.datetime):
-            guessed = guess_datetime_from_name(path.name) or guess_datetime_from_name(str(path))
+        if not meta.datetime:
+            guessed = guess_datetime_from_name(path.name)
             if guessed:
                 meta.datetime = guessed.strftime("%Y-%m-%d %H:%M:%S")
         if not meta.title:
@@ -361,8 +361,8 @@ def read_meta(path: Path) -> PhotoMeta:
             except (TypeError, ValueError):
                 pass
 
-    if not parse_datetime(meta.datetime):
-        guessed = guess_datetime_from_name(path.name) or guess_datetime_from_name(str(path))
+    if not meta.datetime:
+        guessed = guess_datetime_from_name(path.name)
         if guessed:
             meta.datetime = guessed.strftime("%Y-%m-%d %H:%M:%S")
 

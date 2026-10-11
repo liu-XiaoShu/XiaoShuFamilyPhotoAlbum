@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title id="doc-title">小树时光相册</title>
-  <link rel="stylesheet" href="/styles.css?v=3.0.0" />
+  <link rel="stylesheet" href="/styles.css?v=3.0.8" />
   <link rel="icon" href="/api/brand/icon" />
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css" />
   <script>
@@ -123,8 +123,21 @@
           <p class="drop-title" id="drop-title">拖放图片 / 视频或文件夹到这里</p>
           <p class="drop-sub" id="drop-sub">支持 JPEG / HEIC / PNG / MOV / MP4 等，或整个目录</p>
           <div class="drop-actions">
-            <button type="button" id="btn-pick-files" class="btn primary">从相册选择</button>
-            <button type="button" id="btn-pick-dir" class="btn ghost">选择文件夹</button>
+            <span class="btn primary file-pick" id="btn-pick-files">
+              从相册选择
+              <input
+                type="file"
+                id="file-input"
+                class="file-pick-input"
+                accept="image/*,video/*,.heic,.heif,.avif,.jpg,.jpeg,.jpe,.jfif,.png,.webp,.gif,.tif,.tiff,.bmp,.mp4,.mov,.m4v,.webm,.mkv,.avi,.mpeg,.mpg,.mpe,.3gp,.3g2,.mts,.m2ts,.flv,.f4v,.wmv,.asf,.vob,.ogv"
+                multiple
+                aria-label="从相册选择"
+              />
+            </span>
+            <span class="btn ghost file-pick" id="btn-pick-dir">
+              选择文件夹
+              <input type="file" id="dir-input" class="file-pick-input" webkitdirectory multiple aria-label="选择文件夹" />
+            </span>
           </div>
           <p id="drop-status" class="drop-status"></p>
         </div>
@@ -160,14 +173,6 @@
           <ul id="upload-hist-list" class="upload-hist-list"></ul>
           <p id="upload-hist-empty" class="muted upload-hist-empty hidden">暂无记录</p>
         </details>
-        <input
-          type="file"
-          id="file-input"
-          accept="image/*,video/*,.heic,.heif,.avif,.jpg,.jpeg,.jpe,.jfif,.png,.webp,.gif,.tif,.tiff,.bmp,.mp4,.mov,.m4v,.webm,.mkv,.avi,.mpeg,.mpg,.mpe,.3gp,.3g2,.mts,.m2ts,.flv,.f4v,.wmv,.asf,.vob,.ogv"
-          multiple
-          hidden
-        />
-        <input type="file" id="dir-input" webkitdirectory multiple hidden />
         <div id="import-empty" class="empty hidden">暂无待入库媒体，先拖入或选择文件。</div>
         <div class="import-toolbar">
           <label><input type="checkbox" id="check-all" /> 全选</label>
@@ -214,16 +219,28 @@
 
       
       <div id="manage-storage" class="manage-pane hidden">
-        <p class="hint">仅超级用户可见。查重按去掉 EXIF/视频容器元数据后的内容指纹；升级后首次「检查重复项」会重算库内指纹。</p>
-        <div class="storage-toolbar">
-          <button type="button" id="btn-storage-refresh" class="btn ghost">刷新占用</button>
-          <button type="button" id="btn-dedup-check" class="btn primary">检查重复项</button>
-          <button type="button" id="btn-dedup-resolve-oldest" class="btn ghost">一键处理（留最早）</button>
-          <button type="button" id="btn-dedup-resolve-newest" class="btn ghost">一键处理（留最新）</button>
-          <span id="storage-msg" class="muted"></span>
-        </div>
-        <div id="storage-cards" class="storage-cards"></div>
-        <div id="dedup-root" class="dedup-root"></div>
+        <section class="storage-group" aria-labelledby="storage-title">
+          <div class="storage-group-head">
+            <strong id="storage-title">存储占用</strong>
+            <button type="button" id="btn-storage-refresh" class="btn ghost">重新统计</button>
+            <span id="storage-msg" class="muted"></span>
+          </div>
+          <div id="storage-cards" class="storage-cards"></div>
+        </section>
+        <section class="dedup-panel storage-group" aria-labelledby="dedup-title">
+          <div class="storage-group-head">
+            <strong id="dedup-title">查重</strong>
+            <span id="dedup-status" class="muted">尚未检查</span>
+          </div>
+          <p class="hint">只认去掉拍摄信息后的压缩内容。重新压缩或改过尺寸的照片不会被算成重复。</p>
+          <div class="storage-toolbar">
+            <button type="button" id="btn-dedup-check" class="btn primary">检查重复项</button>
+            <button type="button" id="btn-dedup-resolve-oldest" class="btn ghost">一键处理（留最早）</button>
+            <button type="button" id="btn-dedup-resolve-newest" class="btn ghost">一键处理（留最新）</button>
+          </div>
+          <div class="storage-bar" id="dedup-bar" hidden><i id="dedup-bar-fill"></i></div>
+          <div id="dedup-root" class="dedup-root"></div>
+        </section>
       </div>
 
       <div id="manage-settings" class="manage-pane hidden">
@@ -366,7 +383,7 @@
           </div>
           <div class="settings-block" id="settings-index">
             <div class="settings-label">媒资索引</div>
-            <p class="settings-desc">时间线与地图优先读 SQLite 索引，减少扫盘，浏览更流畅。</p>
+            <p class="settings-desc">时间线和地图读的是数据库里的目录，不用每次扫硬盘，所以浏览更快。重建索引只重写这份目录，不会删除或改动相册里的照片和视频。平时不用点；只有浏览缺图、日期错乱时才需要。重建期间浏览会变慢，可能要几分钟。</p>
             <p id="index-status" class="muted">—</p>
             <button type="button" class="btn ghost" id="btn-index-rebuild">重建索引</button>
           </div>
@@ -527,8 +544,8 @@
         <div class="about-page">
           <header class="about-hero">
             <div>
-              <h2 class="about-hero-title">小树时光相册 <span class="about-ver">v3.0.0</span></h2>
-              <p class="about-author muted">作者 · xiaoshu · 更新时间 2026-10-05</p>
+              <h2 class="about-hero-title">小树时光相册 <span class="about-ver">v3.0.8</span></h2>
+              <p class="about-author muted">作者 · xiaoshu · 更新时间 2026-10-11</p>
             </div>
           </header>
 
@@ -552,6 +569,20 @@
               <li>手机窄屏浏览布局；手机端降低缩略图 / 预览负载</li>
             </ul>
             <p class="muted about-note">文件命名：<code>年/月/YYYY-MM-DD-HHMMSS-简述-md5.扩展名</code></p>
+          </section>
+
+          <section class="about-section" aria-labelledby="about-update-title">
+            <h3 id="about-update-title" class="about-section-title">本版更新</h3>
+            <ul class="about-features">
+              <li>手机幻灯片画面铺满并居中，看图用清晰预览</li>
+              <li>存储页分成「占用」和「查重」；访问数据先出汇总</li>
+              <li>入库解析按数据库里的内容指纹标出相册已有的相同文件</li>
+              <li>还没有超级用户时必须先注册，相册不再对局域网开放全部权限</li>
+              <li>苹果 Safari：幻灯片里打开编辑，窗口可以完整显示</li>
+              <li>Mac 入库「从相册选择」可以打开「照片」图库</li>
+              <li>入库提示相册已有相同内容时，可点开展开所在位置</li>
+              <li>手机看图画面居中，顶部的编辑、播放、设置可以点到</li>
+            </ul>
           </section>
 
           <section class="about-section" aria-labelledby="about-limit-title">
@@ -711,7 +742,7 @@
         <label>时间 <input type="datetime-local" id="d-datetime" /></label>
         <label>简述 <input type="text" id="d-title" maxlength="30" /></label>
         <label>描述 <textarea id="d-description" rows="3"></textarea></label>
-        <label>地点 <input type="text" id="d-location" placeholder="例：省 / 市 / 区县" /></label>
+        <label>地点 <input type="text" id="d-location" placeholder="例：杭州市西湖区" /></label>
         <p id="d-location-hint" class="muted loc-hint">写到区县名可定位更准；只写省/市会落在省会或市中心。</p>
         <div id="narration-block" class="narration-block">
           <div class="settings-label">旁白音频</div>
@@ -784,7 +815,7 @@
         <input type="checkbox" id="b-apply-title" />
         <span>简述</span>
       </label>
-      <input type="text" id="b-title" maxlength="30" placeholder="如：示例简述" autocomplete="off" />
+      <input type="text" id="b-title" maxlength="30" placeholder="如：杭州游玩" autocomplete="off" />
     </div>
     <div class="batch-row">
       <label class="batch-apply" for="b-apply-description">
@@ -798,7 +829,7 @@
         <input type="checkbox" id="b-apply-location" />
         <span>地点</span>
       </label>
-      <input type="text" id="b-location" placeholder="如：城市或区县" autocomplete="off" />
+      <input type="text" id="b-location" placeholder="如：杭州西湖" autocomplete="off" />
     </div>
     <div id="batch-progress" class="batch-progress hidden" aria-live="polite">
       <div class="batch-progress-head">
@@ -815,6 +846,6 @@
   </dialog>
 
   <audio id="lb-narration-el" class="lb-narration-el" playsinline webkit-playsinline preload="auto"></audio>
-  <script src="/app.js?v=3.0.0" defer></script>
+  <script src="/app.js?v=3.0.8" defer></script>
 </body>
 </html>

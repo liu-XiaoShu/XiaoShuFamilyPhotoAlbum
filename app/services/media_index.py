@@ -82,10 +82,6 @@ def init_media_tables() -> None:
             con.execute("ALTER TABLE media ADD COLUMN uploaded_by_share_id INTEGER")
         if "content_hash" not in cols:
             con.execute("ALTER TABLE media ADD COLUMN content_hash TEXT")
-        if "duration" not in cols:
-            con.execute("ALTER TABLE media ADD COLUMN duration REAL")
-        if "audio_duration" not in cols:
-            con.execute("ALTER TABLE media ADD COLUMN audio_duration REAL")
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_media_uploader ON media(uploaded_by_share_id)"
         )
@@ -117,14 +113,11 @@ def media_bytes_sum() -> int:
     """索引内原片体积合计（不含旁路/回收站）。"""
     init_media_tables()
     with connect() as con:
-        row = con.execute(
-            "SELECT COALESCE(SUM(size), 0) AS n FROM media"
-        ).fetchone()
+        row = con.execute("SELECT COALESCE(SUM(size), 0) AS n FROM media").fetchone()
         return int(row["n"] if row else 0)
 
 
 def content_hash_coverage() -> dict:
-    """入库指纹覆盖率：查重应优先读库，仅对缺失项补算。"""
     init_media_tables()
     with connect() as con:
         total = int(con.execute("SELECT COUNT(*) AS n FROM media").fetchone()["n"])
@@ -143,30 +136,6 @@ def content_hash_coverage() -> dict:
         "missing": missing,
         "complete": missing == 0,
     }
-
-
-def content_hash_algo_state() -> dict:
-    """当前去重算法是否已应用到库内指纹。"""
-    from .naming import CONTENT_HASH_ALGO
-
-    init_media_tables()
-    with connect() as con:
-        stored = _get_kv(con, "content_hash_algo") or ""
-    needs = stored != CONTENT_HASH_ALGO
-    return {
-        "algo": CONTENT_HASH_ALGO,
-        "stored": stored,
-        "needs_rehash": needs,
-    }
-
-
-def set_content_hash_algo(algo: str | None = None) -> None:
-    from .naming import CONTENT_HASH_ALGO
-
-    init_media_tables()
-    with connect() as con:
-        _set_kv(con, "content_hash_algo", algo or CONTENT_HASH_ALGO)
-        con.commit()
 
 
 def status() -> dict:
@@ -206,32 +175,13 @@ def _row_from_file(path: Path, rel: str) -> dict[str, Any] | None:
     year = parts[0]
     month = parts[1] if len(parts) > 1 else f"{year}-01"
     has_audio = 0
-    duration = None
-    audio_duration = None
     try:
         from .library import narration_file
 
-        narr = narration_file(path)
-        if narr:
+        if narration_file(path):
             has_audio = 1
-            try:
-                from .video import probe_duration
-
-                audio_duration = probe_duration(narr)
-            except Exception:
-                pass
     except Exception:
         pass
-    if is_video(path):
-        try:
-            from .video import probe_duration, read_sidecar
-
-            side = read_sidecar(path)
-            duration = side.get("duration")
-            if duration is None:
-                duration = probe_duration(path)
-        except Exception:
-            pass
     lat, lng = meta.lat, meta.lng
     # 入库进索引时就把地点文本解析成坐标，浏览地图不再现算
     if (lat is None or lng is None) and (meta.location or "").strip():
@@ -254,8 +204,6 @@ def _row_from_file(path: Path, rel: str) -> dict[str, Any] | None:
         "lat": lat,
         "lng": lng,
         "has_audio": has_audio,
-        "duration": duration,
-        "audio_duration": audio_duration,
         "mtime": st.st_mtime,
         "size": st.st_size,
         "updated_at": _iso(),
@@ -308,10 +256,7 @@ def _schedule_tile_prefetch(lat: float, lng: float) -> None:
 
 
 def upsert_media(
-    album_rel: str,
-    *,
-    uploaded_by_share_id: int | None = None,
-    content_hash: str | None = None,
+    album_rel: str, *, uploaded_by_share_id: int | None = None
 ) -> None:
     rel = str(album_rel).replace("\\", "/").lstrip("/")
     from .library import album_path
@@ -326,9 +271,6 @@ def upsert_media(
             con.execute("DELETE FROM media WHERE path = ?", (rel,))
             invalidate = True
         else:
-            h = (content_hash or "").strip().lower()
-            if len(h) >= 8 and all(c in "0123456789abcdef" for c in h):
-                row["content_hash"] = h
             # 新入库可写归属；后续元数据更新保留原 uploaded_by_share_id
             sid = (
                 int(uploaded_by_share_id)
@@ -340,8 +282,8 @@ def upsert_media(
                 INSERT INTO media(
                   path, name, kind, year, month, datetime, title, description,
                   location, lat, lng, has_audio, mtime, size, updated_at,
-                  uploaded_by_share_id, content_hash, duration, audio_duration
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  uploaded_by_share_id, content_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                   name=excluded.name, kind=excluded.kind, year=excluded.year,
                   month=excluded.month, datetime=excluded.datetime, title=excluded.title,
@@ -353,9 +295,7 @@ def upsert_media(
                   ),
                   content_hash=COALESCE(
                     excluded.content_hash, media.content_hash
-                  ),
-                  duration=COALESCE(excluded.duration, media.duration),
-                  audio_duration=COALESCE(excluded.audio_duration, media.audio_duration)
+                  )
                 """,
                 (
                     row["path"],
@@ -375,19 +315,13 @@ def upsert_media(
                     row["updated_at"],
                     sid,
                     row.get("content_hash"),
-                    row.get("duration"),
-                    row.get("audio_duration"),
                 ),
             )
             invalidate = True
-    # 批量入库时由调用方统一清缓存，避免每张图都刷大纲/地图
-    if invalidate and upsert_media._flush_now:
+    if invalidate:
         invalidate_browse_caches()
     if row and row.get("lat") is not None and row.get("lng") is not None:
         _schedule_tile_prefetch(row["lat"], row["lng"])
-
-
-upsert_media._flush_now = True
 
 
 def is_owned_by_share(album_rel: str, share_id: int) -> bool:
@@ -437,9 +371,15 @@ def rebuild_index(*, force: bool = False) -> dict:
     try:
         init_media_tables()
         root = config.album_root
-        # 重建前保留访客入库归属，避免扫盘后丢失「自己上传的可见」
+        # 重建前保留访客入库归属和内容指纹，避免扫盘后丢失
         owners: dict[str, int] = {}
+        hashes: dict[str, str] = {}
         with connect() as con:
+            for r in con.execute(
+                "SELECT path, content_hash FROM media "
+                "WHERE content_hash IS NOT NULL AND TRIM(content_hash) != ''"
+            ).fetchall():
+                hashes[str(r["path"])] = str(r["content_hash"]).strip().lower()
             for r in con.execute(
                 "SELECT path, uploaded_by_share_id FROM media "
                 "WHERE uploaded_by_share_id IS NOT NULL"
@@ -463,6 +403,9 @@ def rebuild_index(*, force: bool = False) -> dict:
                         row["uploaded_by_share_id"] = owners[row["path"]]
                     else:
                         row["uploaded_by_share_id"] = None
+                    kept = hashes.get(row["path"])
+                    if kept:
+                        row["content_hash"] = kept
                     rows.append(row)
         with connect() as con:
             con.execute("DELETE FROM media")
@@ -471,8 +414,8 @@ def rebuild_index(*, force: bool = False) -> dict:
                 INSERT INTO media(
                   path, name, kind, year, month, datetime, title, description,
                   location, lat, lng, has_audio, mtime, size, updated_at,
-                  uploaded_by_share_id, content_hash, duration, audio_duration
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  uploaded_by_share_id, content_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -493,8 +436,6 @@ def rebuild_index(*, force: bool = False) -> dict:
                         r["updated_at"],
                         r.get("uploaded_by_share_id"),
                         r.get("content_hash"),
-                        r.get("duration"),
-                        r.get("audio_duration"),
                     )
                     for r in rows
                 ],
@@ -567,51 +508,20 @@ def ensure_index_ready() -> None:
 
 
 def _photo_dict(r: sqlite3.Row | dict) -> dict:
-    def _g(key: str, default=None):
-        try:
-            if isinstance(r, dict):
-                return r.get(key, default)
-            return r[key] if key in r.keys() else default
-        except Exception:
-            return default
-
     return {
-        "path": _g("path"),
-        "name": _g("name"),
-        "kind": _g("kind"),
-        "has_audio": bool(_g("has_audio") or 0),
-        "duration": _g("duration"),
-        "audio_duration": _g("audio_duration"),
-        "size": _g("size"),
+        "path": r["path"],
+        "name": r["name"],
+        "kind": r["kind"],
+        "has_audio": bool(r["has_audio"]),
         "meta": {
-            "datetime": _g("datetime"),
-            "title": _g("title"),
-            "description": _g("description"),
-            "location": _g("location"),
-            "lat": _g("lat"),
-            "lng": _g("lng"),
+            "datetime": r["datetime"],
+            "title": r["title"],
+            "description": r["description"],
+            "location": r["location"],
+            "lat": r["lat"],
+            "lng": r["lng"],
         },
     }
-
-
-def lookup_media(album_rel: str) -> dict | None:
-    """按路径读索引行（灯箱/详情优先走库，避免每次扫盘 probe）。"""
-    rel = str(album_rel).replace("\\", "/").lstrip("/")
-    if not rel:
-        return None
-    init_media_tables()
-    with connect() as con:
-        row = con.execute(
-            """
-            SELECT path, name, kind, datetime, title, description, location,
-                   lat, lng, has_audio, size, duration, audio_duration, mtime
-            FROM media WHERE path = ?
-            """,
-            (rel,),
-        ).fetchone()
-    if not row:
-        return None
-    return _photo_dict(row)
 
 
 def _scope_clause(
@@ -654,18 +564,6 @@ def _scope_clause(
         parts.append("(path = ? OR path LIKE ?)")
         args.extend([s, s + "/%"])
     return _combine(" OR ".join(parts), args)
-
-
-def _kind_clause(kind: str | None) -> tuple[str, list[Any]]:
-    """媒体类型过滤：image / video；其它视为全部。"""
-    k = (kind or "").strip().lower()
-    if k == "video":
-        return " AND kind = ?", ["video"]
-    if k == "image":
-        # 历史数据可能缺 kind：非 video 都当照片
-        return " AND IFNULL(kind, 'image') != ?", ["video"]
-    return "", []
-
 
 def timeline_from_index() -> dict | None:
     init_media_tables()
@@ -814,9 +712,8 @@ def timeline_month(
     scopes: list[str] | None = None,
     media_paths: list[str] | None = None,
     uploaded_by_share_id: int | None = None,
-    kind: str | None = None,
 ) -> dict:
-    """按月分页拉取照片（新→旧）。kind=image|video 时在库内过滤。"""
+    """按月分页拉取照片（新→旧）。"""
     init_media_tables()
     month = (month or "").strip()
     if not month:
@@ -829,27 +726,25 @@ def timeline_month(
             "limit": limit,
             "has_more": False,
             "from_index": True,
-            "kind": kind or "all",
         }
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
     where, args = _scope_clause(scopes, media_paths, uploaded_by_share_id)
-    kind_sql, kind_args = _kind_clause(kind)
     year = month[:4] if len(month) >= 4 else ""
     with connect() as con:
         total = con.execute(
-            f"SELECT COUNT(*) AS n FROM media WHERE month = ?{where}{kind_sql}",
-            [month, *args, *kind_args],
+            f"SELECT COUNT(*) AS n FROM media WHERE month = ?{where}",
+            [month, *args],
         ).fetchone()["n"]
         rows = con.execute(
             f"""
             SELECT path, name, kind, year, month, datetime, title, description, location, lat, lng, has_audio
             FROM media
-            WHERE month = ?{where}{kind_sql}
+            WHERE month = ?{where}
             ORDER BY datetime DESC, path DESC
             LIMIT ? OFFSET ?
             """,
-            [month, *args, *kind_args, limit, offset],
+            [month, *args, limit, offset],
         ).fetchall()
     photos = [_photo_dict(r) for r in rows]
     return {
@@ -861,7 +756,6 @@ def timeline_month(
         "limit": limit,
         "has_more": offset + len(photos) < int(total),
         "from_index": True,
-        "kind": (kind or "all"),
     }
 
 
@@ -872,12 +766,10 @@ def timeline_paths(
     scopes: list[str] | None = None,
     media_paths: list[str] | None = None,
     uploaded_by_share_id: int | None = None,
-    kind: str | None = None,
 ) -> dict:
     """仅返回 path 列表（多选/批量用），避免拉全量元数据。"""
     init_media_tables()
     where, args = _scope_clause(scopes, media_paths, uploaded_by_share_id)
-    kind_sql, kind_args = _kind_clause(kind)
     clauses = ["1=1"]
     params: list[Any] = []
     if month:
@@ -886,34 +778,28 @@ def timeline_paths(
     elif year:
         clauses.append("year = ?")
         params.append(year.strip())
-    sql = (
-        f"SELECT path FROM media WHERE {' AND '.join(clauses)}{where}{kind_sql} "
-        "ORDER BY datetime DESC, path DESC"
-    )
+    sql = f"SELECT path FROM media WHERE {' AND '.join(clauses)}{where} ORDER BY datetime DESC, path DESC"
     with connect() as con:
-        rows = con.execute(sql, [*params, *args, *kind_args]).fetchall()
+        rows = con.execute(sql, [*params, *args]).fetchall()
     paths = [r["path"] for r in rows]
-    return {"paths": paths, "total": len(paths), "from_index": True, "kind": kind or "all"}
+    return {"paths": paths, "total": len(paths), "from_index": True}
 
 
-def map_points_from_index(kind: str | None = None) -> dict | None:
+def map_points_from_index() -> dict | None:
     init_media_tables()
-    kind_sql, kind_args = _kind_clause(kind)
     with connect() as con:
         n = con.execute("SELECT COUNT(*) AS n FROM media").fetchone()["n"]
         if n == 0:
             return None
         # 坐标在入库/索引时已写入；此处不再现解析地点（避免首屏/地图卡顿）
         rows = con.execute(
-            f"""
+            """
             SELECT path, name, kind, location, lat, lng, title, datetime FROM media
-            WHERE lat IS NOT NULL AND lng IS NOT NULL{kind_sql}
-            """,
-            kind_args,
+            WHERE lat IS NOT NULL AND lng IS NOT NULL
+            """
         ).fetchall()
         skipped = con.execute(
-            f"SELECT COUNT(*) AS n FROM media WHERE lat IS NULL OR lng IS NULL{kind_sql}",
-            kind_args,
+            "SELECT COUNT(*) AS n FROM media WHERE lat IS NULL OR lng IS NULL"
         ).fetchone()["n"]
     points = [
         {
@@ -933,8 +819,7 @@ def map_points_from_index(kind: str | None = None) -> dict | None:
     ]
 
     def _in_china(lat: float, lng: float) -> bool:
-        # 南界约海南三亚；过低会把泰国中心点误判成「国内」
-        return 18.0 <= lat <= 54.5 and 73.0 <= lng <= 135.5
+        return 15.0 <= lat <= 54.5 and 72.0 <= lng <= 135.5
 
     has_foreign = any(not _in_china(p["lat"], p["lng"]) for p in points)
     return {
@@ -949,14 +834,8 @@ def map_points_from_index(kind: str | None = None) -> dict | None:
 
 
 def _map_cell(zoom: int) -> float:
-    """地图聚合网格边长（度）。
-
-    原先 z+2 在默认世界视野（约 zoom 5）会把港深揉成一簇，封面常被深圳盖住，
-    看起来像香港没点。略加密后邻近城市更早分开。
-    """
     z = max(2, min(int(zoom or 4), 18))
-    # z+5：默认世界视野（约 zoom 5）即可把港/深分开
-    return max(0.02, 360.0 / (2 ** (z + 5)))
+    return max(0.02, 360.0 / (2 ** (z + 2)))
 
 
 def map_summary(
@@ -996,7 +875,7 @@ def map_summary(
     has_foreign = False
     if n and geo["min_lat"] is not None:
         def _out(lat: float, lng: float) -> bool:
-            return not (18.0 <= lat <= 54.5 and 73.0 <= lng <= 135.5)
+            return not (15.0 <= lat <= 54.5 and 72.0 <= lng <= 135.5)
 
         has_foreign = (
             _out(float(geo["min_lat"]), float(geo["min_lng"]))
@@ -1039,14 +918,12 @@ def map_clusters(
     media_paths: list[str] | None = None,
     uploaded_by_share_id: int | None = None,
     limit: int = 800,
-    kind: str | None = None,
 ) -> dict:
     """按缩放网格服务端聚合，仅返回簇摘要（含封面 path）。"""
     init_media_tables()
     cell = _map_cell(zoom)
     limit = max(1, min(int(limit), 1500))
     where, args = _scope_clause(scopes, media_paths, uploaded_by_share_id)
-    kind_sql, kind_args = _kind_clause(kind)
     bbox = ""
     bargs: list[Any] = []
     if None not in (west, south, east, north):
@@ -1066,47 +943,18 @@ def map_clusters(
               COUNT(*) AS cnt,
               MAX(datetime || '|' || path) AS cover_key
             FROM media
-            WHERE lat IS NOT NULL AND lng IS NOT NULL{where}{kind_sql}{bbox}
+            WHERE lat IS NOT NULL AND lng IS NOT NULL{where}{bbox}
             GROUP BY gy, gx
             ORDER BY cnt DESC
             LIMIT ?
             """,
-            [cell, cell, *args, *kind_args, *bargs, limit],
+            [cell, cell, *args, *bargs, limit],
         ).fetchall()
 
         clusters = []
         for r in rows:
             cover_key = r["cover_key"] or ""
             cover_path = cover_key.split("|", 1)[-1] if cover_key else ""
-            # 多地点揉在一簇时，封面优先取该簇「出现最多」的地点里最新一张
-            mode = con.execute(
-                """
-                SELECT location FROM media
-                WHERE lat IS NOT NULL AND lng IS NOT NULL
-                  AND CAST(ROUND(lat / ?) AS INTEGER) = ?
-                  AND CAST(ROUND(lng / ?) AS INTEGER) = ?
-                  AND location IS NOT NULL AND TRIM(location) != ''
-                GROUP BY location
-                ORDER BY COUNT(*) DESC, MAX(datetime) DESC
-                LIMIT 1
-                """,
-                (cell, int(r["gy"]), cell, int(r["gx"])),
-            ).fetchone()
-            if mode and mode["location"]:
-                pref = con.execute(
-                    """
-                    SELECT path FROM media
-                    WHERE lat IS NOT NULL AND lng IS NOT NULL
-                      AND CAST(ROUND(lat / ?) AS INTEGER) = ?
-                      AND CAST(ROUND(lng / ?) AS INTEGER) = ?
-                      AND location = ?
-                    ORDER BY datetime DESC, path DESC
-                    LIMIT 1
-                    """,
-                    (cell, int(r["gy"]), cell, int(r["gx"]), mode["location"]),
-                ).fetchone()
-                if pref and pref["path"]:
-                    cover_path = pref["path"]
             cover = None
             if cover_path:
                 cr = con.execute(
@@ -1233,6 +1081,40 @@ def start_rebuild_async() -> dict:
     return {"ok": True, "message": "已开始重建索引", **status()}
 
 
+def indexed_photo(album_rel: str) -> dict | None:
+    """看图用的元数据。优先读库，避免每次打开都解析原片 EXIF。"""
+    rel = str(album_rel).replace("\\", "/").lstrip("/")
+    if not rel:
+        return None
+    init_media_tables()
+    with connect() as con:
+        row = con.execute("SELECT * FROM media WHERE path = ?", (rel,)).fetchone()
+    if not row:
+        return None
+    d = {k: row[k] for k in row.keys()}
+    return {
+        "path": rel,
+        "name": d.get("name"),
+        "size": d.get("size"),
+        "kind": d.get("kind") or "image",
+        "meta": {
+            "datetime": d.get("datetime"),
+            "title": d.get("title"),
+            "description": d.get("description"),
+            "location": d.get("location"),
+            "lat": d.get("lat"),
+            "lng": d.get("lng"),
+        },
+        "has_audio": bool(d.get("has_audio")),
+        "audio_path": None,
+        "audio_duration": d.get("audio_duration"),
+        "duration": d.get("duration"),
+        "has_live": False,
+        "live_video_path": None,
+        "from_index": True,
+    }
+
+
 def set_content_hash(album_rel: str, content_hash: str) -> None:
     rel = str(album_rel).replace("\\", "/").lstrip("/")
     h = (content_hash or "").strip().lower()
@@ -1244,41 +1126,6 @@ def set_content_hash(album_rel: str, content_hash: str) -> None:
             "UPDATE media SET content_hash = ?, updated_at = ? WHERE path = ?",
             (h, _iso(), rel),
         )
-
-
-def patch_media_meta(
-    album_rel: str,
-    fields: dict,
-    *,
-    invalidate: bool = True,
-) -> None:
-    """轻量更新索引元数据字段，避免批量编辑时反复读盘/探测视频时长。
-
-    fields 仅含要改的键；值可为 None（表示清空该字段）。
-    """
-    rel = str(album_rel).replace("\\", "/").lstrip("/")
-    if not rel or not fields:
-        return
-    allowed = ("datetime", "title", "description", "location", "lat", "lng", "year", "month")
-    sets: list[str] = []
-    args: list = []
-    for key in allowed:
-        if key in fields:
-            sets.append(f"{key} = ?")
-            args.append(fields[key])
-    if not sets:
-        return
-    sets.append("updated_at = ?")
-    args.append(_iso())
-    args.append(rel)
-    init_media_tables()
-    with connect() as con:
-        con.execute(
-            f"UPDATE media SET {', '.join(sets)} WHERE path = ?",
-            tuple(args),
-        )
-    if invalidate:
-        invalidate_browse_caches()
 
 
 def paths_by_content_hash(content_hash: str) -> list[str]:
@@ -1294,49 +1141,31 @@ def paths_by_content_hash(content_hash: str) -> list[str]:
     return [r["path"] for r in rows]
 
 
-def content_hash_path_map() -> dict[str, list[str]]:
-    """一次加载全部已入库指纹 → 路径列表，供待入库批量查重。"""
-    init_media_tables()
-    out: dict[str, list[str]] = {}
-    with connect() as con:
-        rows = con.execute(
-            """
-            SELECT content_hash, path FROM media
-            WHERE content_hash IS NOT NULL AND TRIM(content_hash) != ''
-            ORDER BY path
-            """
-        ).fetchall()
-    for r in rows:
-        h = (r["content_hash"] or "").strip().lower()
-        if not h:
-            continue
-        out.setdefault(h, []).append(r["path"])
-    return out
-
-
 def duplicate_groups(*, limit: int = 200) -> dict:
     init_media_tables()
-    coverage = content_hash_coverage()
-    algo = content_hash_algo_state()
+    cap = max(1, min(int(limit or 200), 500))
     with connect() as con:
         rows = con.execute(
             """
             SELECT content_hash, COUNT(*) AS c
             FROM media
             WHERE content_hash IS NOT NULL AND TRIM(content_hash) != ''
+              AND path NOT LIKE '.trash/%'
             GROUP BY content_hash
             HAVING c > 1
             ORDER BY c DESC
             LIMIT ?
             """,
-            (max(1, min(int(limit or 200), 500)),),
+            (cap,),
         ).fetchall()
         groups = []
         for r in rows:
             items = con.execute(
                 """
                 SELECT path, name, kind, size, datetime, title
-                FROM media WHERE content_hash = ? ORDER BY datetime, path
+                FROM media
+                WHERE content_hash = ? AND path NOT LIKE '.trash/%'
+                ORDER BY datetime, path
                 """,
                 (r["content_hash"],),
             ).fetchall()
@@ -1360,12 +1189,7 @@ def duplicate_groups(*, limit: int = 200) -> dict:
     return {
         "groups": groups,
         "count": len(groups),
-        "total": coverage["total"],
-        "hashed": coverage["hashed"],
-        "missing": coverage["missing"],
-        "complete": coverage["complete"],
-        "hash_algo": algo["algo"],
-        "needs_rehash": algo["needs_rehash"],
+        "truncated": len(groups) >= cap,
     }
 
 
@@ -1377,24 +1201,15 @@ def search_media(
     scopes: list[str] | None = None,
     media_paths: list[str] | None = None,
     uploaded_by_share_id: int | None = None,
-    kind: str | None = None,
 ) -> dict:
     init_media_tables()
     text = (q or "").strip()
     if not text:
-        return {
-            "items": [],
-            "total": 0,
-            "q": q,
-            "limit": limit,
-            "offset": offset,
-            "kind": kind or "all",
-        }
+        return {"items": [], "total": 0, "q": q, "limit": limit, "offset": offset}
     limit = max(1, min(int(limit or 60), 200))
     offset = max(0, int(offset or 0))
     like = f"%{text}%"
     where_scope, args_scope = _scope_clause(scopes, media_paths, uploaded_by_share_id)
-    kind_sql, kind_args = _kind_clause(kind)
     sql_where = (
         " WHERE ("
         " IFNULL(title,'') LIKE ? OR IFNULL(description,'') LIKE ?"
@@ -1402,9 +1217,8 @@ def search_media(
         " OR IFNULL(path,'') LIKE ? OR IFNULL(datetime,'') LIKE ?"
         " )"
         + where_scope
-        + kind_sql
     )
-    args = [like, like, like, like, like, like] + args_scope + kind_args
+    args = [like, like, like, like, like, like] + args_scope
     with connect() as con:
         total = con.execute(
             f"SELECT COUNT(*) AS c FROM media{sql_where}", args
@@ -1431,5 +1245,4 @@ def search_media(
         "q": text,
         "limit": limit,
         "offset": offset,
-        "kind": kind or "all",
     }

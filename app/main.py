@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import mimetypes
 from urllib.parse import quote
@@ -13,10 +12,10 @@ _VENDOR = Path(__file__).resolve().parents[1] / ".vendor"
 if _VENDOR.exists() and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .config import ROOT, config
@@ -41,10 +40,16 @@ async def lifespan(_app: FastAPI):
         media_index.ensure_index_ready()
     except Exception:
         pass
+    try:
+        from .services.dedup_scan import kick_dedup_scan
+
+        kick_dedup_scan()
+    except Exception:
+        pass
     yield
 
 
-app = FastAPI(title="小树时光相册", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="小树时光相册", version="3.0.8", lifespan=lifespan)
 
 
 def _skip_visitor_log(path: str) -> bool:
@@ -53,16 +58,46 @@ def _skip_visitor_log(path: str) -> bool:
         return True
     if path.startswith(("/vendor/", "/static/", "/assets/")):
         return True
-    if path.startswith(("/api/thumb", "/api/map/tiles", "/api/brand/icon")):
+    if path.startswith(("/api/thumb", "/api/preview", "/api/map/tiles", "/api/brand/icon")):
         return True
     if path.endswith((".js", ".css", ".map", ".woff2", ".png", ".jpg", ".webp", ".ico")):
         return True
     return False
 
 
+def _setup_open(path: str) -> bool:
+    """还没有超级用户时，只放行注册、登录和静态页。"""
+    if path in ("/", "/login", "/favicon.ico", "/manifest.webmanifest"):
+        return True
+    if path.startswith(
+        (
+            "/api/health",
+            "/api/me",
+            "/api/auth/setup",
+            "/api/auth/login",
+            "/api/auth/share-enter",
+            "/api/config",
+            "/api/brand/",
+            "/login",
+            "/vendor/",
+            "/static/",
+        )
+    ):
+        return True
+    return path.endswith((".js", ".css", ".svg", ".png", ".ico", ".webmanifest", ".woff2"))
+
+
 @app.middleware("http")
 async def visitor_guard_and_log(request: Request, call_next):
     path = request.url.path or "/"
+    if not auth.has_admin() and not _setup_open(path):
+        if path.startswith("/api/"):
+            return Response(
+                content='{"detail":"请先创建超级用户"}',
+                status_code=403,
+                media_type="application/json",
+            )
+        return Response(status_code=302, headers={"Location": "/login"})
     skip_log = _skip_visitor_log(path)
     headers = {k.lower(): v for k, v in request.headers.items()}
     ip = visitors._client_ip(headers, request.client.host if request.client else None)
@@ -75,8 +110,6 @@ async def visitor_guard_and_log(request: Request, call_next):
             media_type="application/json",
         )
     response = await call_next(request)
-    response.headers["Permissions-Policy"] = "microphone=*, autoplay=*"
-    response.headers["Feature-Policy"] = "microphone *; autoplay *"
     if skip_log:
         return response
     try:
@@ -130,9 +163,8 @@ class IngestBatch(BaseModel):
 
 
 class ImportDiscard(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    paths: List[str] = Field(default_factory=list)
-    clear_all: bool = False
+    paths: List[str] = []
+    all: bool = False
 
 
 class ImportParse(BaseModel):
@@ -179,12 +211,6 @@ class EditSave(BaseModel):
     trim_end: Optional[float] = None
 
 
-class NarrationB64(BaseModel):
-    filename: str = "narration.m4a"
-    mime: str = ""
-    data_b64: str = ""
-
-
 class CoverUpdate(BaseModel):
     at_time: float = Field(ge=0, description="封面帧时间（秒）")
 
@@ -195,10 +221,6 @@ class TrashPaths(BaseModel):
 
 class TrashIds(BaseModel):
     ids: List[str]
-
-class DedupScan(BaseModel):
-    force: bool = False
-
 
 class DedupResolve(BaseModel):
     keep: str
@@ -263,19 +285,6 @@ def require_edit(p: dict = Depends(current_principal)) -> dict:
     return p
 
 
-def require_narration_write(p: dict = Depends(current_principal)) -> dict:
-    """旁白：管理员、可编辑/可入库，以及已登录的分享访客均可保存。"""
-    if (
-        p.get("is_admin")
-        or p.get("can_edit")
-        or p.get("can_upload")
-        or p.get("open_mode")
-        or p.get("kind") == "share"
-    ):
-        return p
-    raise HTTPException(403, "请先登录管理员或打开分享链接后再保存旁白")
-
-
 def require_upload(p: dict = Depends(current_principal)) -> dict:
     if not p.get("can_upload"):
         raise HTTPException(403, "当前账号无权入库")
@@ -296,7 +305,6 @@ def require_purge(p: dict = Depends(current_principal)) -> dict:
 
 def _guard_album_path(path: str, p: dict) -> str:
     rel = (path or "").replace("\\", "/").lstrip("/")
-    rel = library.canonicalize_album_rel(rel)
     if rel.startswith(".trash/") or rel == ".trash":
         if not (p.get("can_trash") or p.get("can_settings") or p.get("open_mode")):
             raise HTTPException(403, "无权访问回收站内容")
@@ -357,8 +365,8 @@ def health():
     return {
         "ok": True,
         "name": config.album_title,
-        "version": "3.0.0",
-        "released_at": "2026-10-05",
+        "version": "3.0.8",
+        "released_at": "2026-10-11",
         "author": "xiaoshu",
     }
 
@@ -551,11 +559,7 @@ def shares_qr(share_id: int, request: Request, p: dict = Depends(require_setting
         png = auth.qr_png_bytes(url)
     except Exception as e:
         raise HTTPException(500, f"二维码生成失败: {e}")
-    return Response(
-        content=png,
-        media_type="image/png",
-        headers={"Cache-Control": "private, max-age=3600"},
-    )
+    return Response(content=png, media_type="image/png")
 
 
 def _config_payload(*, include_stats: bool = True) -> dict:
@@ -859,7 +863,7 @@ async def import_upload(
         try:
             with dest.open("wb") as out:
                 while True:
-                    chunk = await f.read(4 * 1024 * 1024)
+                    chunk = await f.read(1024 * 1024)
                     if not chunk:
                         break
                     out.write(chunk)
@@ -876,45 +880,79 @@ async def import_upload(
             skipped.append("/".join(parts))
         finally:
             await f.close()
-    library.invalidate_import_list_cache()
     return {"ok": True, "saved": saved, "skipped": skipped, "count": len(saved)}
 
 
 @app.post("/api/import/parse")
-def import_parse(body: ImportParse | None = None, p: dict = Depends(require_upload)):
-    """分片解析 EXIF + MD5 查重；前端循环调用直到 done。"""
+def import_parse(body: Optional[ImportParse] = None, p: dict = Depends(require_upload)):
+    """分片解析，并用数据库里的内容指纹标出相册已有的相同文件。"""
+    from .services.metadata import read_meta
+    from .services.ops import content_hash_of
+
     req = body or ImportParse()
-    result = library.parse_import_meta(offset=req.offset, limit=req.limit, paths=req.paths)
-    album_dups = int(result.get("duplicate_album") or 0)
-    inbox_dups = int(result.get("duplicate_inbox") or 0)
-    processed = int(result.get("processed") or 0)
-    total = int(result.get("total") or 0)
-    done = bool(result.get("done"))
+    items = library.list_import_images(with_meta=False)
+    if req.paths:
+        wanted = {str(p).replace("\\", "/").lstrip("/") for p in req.paths if p}
+        items = [it for it in items if it.get("path") in wanted]
+    total = len(items)
+    offset = max(0, int(req.offset or 0))
+    limit = max(1, min(int(req.limit or 40), 80))
+    chunk = items[offset : offset + limit]
+    out = []
+    album_dups = 0
+    for it in chunk:
+        rel = it["path"]
+        row = dict(it)
+        full = library.import_path(rel)
+        try:
+            row["meta"] = read_meta(full).to_dict()
+        except Exception:
+            row["meta"] = it.get("meta") or {}
+        try:
+            digest = content_hash_of(full) if full.is_file() else ""
+        except OSError:
+            digest = ""
+        found = []
+        if digest:
+            found = [
+                p
+                for p in media_index.paths_by_content_hash(digest)
+                if p and not str(p).startswith(".trash/")
+            ]
+        row["content_hash"] = digest
+        row["duplicate"] = bool(found)
+        row["duplicate_of"] = found
+        if found:
+            album_dups += 1
+        out.append(row)
+    processed = offset + len(out)
+    done = processed >= total
     if done:
         msg = (
             f"解析完成：相册已有重复 {album_dups} 项"
-            + (f"，待入库内重复 {inbox_dups} 项" if inbox_dups else "")
-            if (album_dups or inbox_dups)
+            if album_dups
             else "解析完成：未发现与相册重复的内容"
         )
     else:
         msg = f"正在解析… {processed}/{total}"
     return {
-        **result,
-        "message": msg,
+        "items": out,
+        "offset": offset,
+        "processed": processed,
+        "total": total,
+        "done": done,
         "duplicate_album": album_dups,
-        "duplicate_inbox": inbox_dups,
+        "duplicate_inbox": 0,
+        "message": msg,
     }
 
 
 @app.post("/api/import/discard")
 def import_discard(body: ImportDiscard, p: dict = Depends(require_upload)):
-    """从待入库区移除（不进相册）。clear_all=true 清空全部。"""
-    extra = body.model_extra or {}
-    want_all = bool(body.clear_all or extra.get("all") or extra.get("all_items"))
-    if not want_all and not body.paths:
-        raise HTTPException(400, "请指定要移除的路径，或 clear_all=true 清空")
-    return library.discard_import(paths=body.paths, all_items=want_all)
+    """从待入库区移除（不进相册）。all=true 清空全部。"""
+    if not body.all and not body.paths:
+        raise HTTPException(400, "请指定要移除的路径，或 all=true 清空")
+    return library.discard_import(paths=body.paths, all_items=body.all)
 
 
 @app.post("/api/import/ingest")
@@ -925,60 +963,49 @@ def import_ingest(
 ):
     uploader = auth.share_uploader_id(p)
     results = []
-    from .services import media_index as _mi
-
-    prev_flush = getattr(_mi.upsert_media, "_flush_now", True)
-    _mi.upsert_media._flush_now = False
-    try:
-        for item in body.items:
-            try:
-                r = library.ingest_one(
-                    item.path,
-                    datetime_str=item.datetime,
-                    title=item.title,
-                    description=item.description,
-                    reflection=item.reflection,
-                    location=item.location,
-                    from_import=True,
-                    uploaded_by_share_id=uploader,
-                    content_hash=item.content_hash,
-                    skip_meta_read=bool(item.skip_meta_read),
-                )
-                if r.get("ok"):
-                    album_rel = r.get("path") or ""
+    for item in body.items:
+        try:
+            r = library.ingest_one(
+                item.path,
+                datetime_str=item.datetime,
+                title=item.title,
+                description=item.description,
+                reflection=item.reflection,
+                location=item.location,
+                from_import=True,
+                uploaded_by_share_id=uploader,
+                content_hash=item.content_hash,
+                skip_meta_read=bool(item.skip_meta_read),
+            )
+            if r.get("ok"):
+                album_rel = r.get("path") or ""
+                try:
+                    size = 0
+                    kind = "image"
                     try:
-                        size = 0
-                        kind = "image"
-                        try:
-                            fp = library.album_path(album_rel)
-                            size = fp.stat().st_size if fp.is_file() else 0
-                            from .services.naming import is_video
+                        fp = library.album_path(album_rel)
+                        size = fp.stat().st_size if fp.is_file() else 0
+                        from .services.naming import is_video
 
-                            kind = "video" if is_video(fp) else "image"
-                        except Exception:
-                            pass
-                        visitors.record_ingest(
-                            principal=p,
-                            path=album_rel,
-                            name=Path(album_rel).name,
-                            kind=kind,
-                            size=size,
-                            title=item.title or "",
-                        )
+                        kind = "video" if is_video(fp) else "image"
                     except Exception:
                         pass
-                    if album_rel and not r.get("duplicate"):
-                        # 入库高峰只预热列表缩略图，避免 USB 盘同时写多套图把网卡打满
-                        background_tasks.add_task(library.ensure_thumb, album_rel, 320)
-                results.append(r)
-            except Exception as e:
-                results.append({"ok": False, "path": item.path, "message": str(e)})
-    finally:
-        _mi.upsert_media._flush_now = prev_flush
-        try:
-            _mi.invalidate_browse_caches()
-        except Exception:
-            pass
+                    visitors.record_ingest(
+                        principal=p,
+                        path=album_rel,
+                        name=Path(album_rel).name,
+                        kind=kind,
+                        size=size,
+                        title=item.title or "",
+                    )
+                except Exception:
+                    pass
+                # 入库成功后后台预热经典模式常用 320 缩略图（不阻塞响应）
+                if album_rel and not r.get("duplicate"):
+                    background_tasks.add_task(library.ensure_thumb, album_rel, 320)
+            results.append(r)
+        except Exception as e:
+            results.append({"ok": False, "path": item.path, "message": str(e)})
     return {"results": results}
 
 
@@ -996,87 +1023,68 @@ def search_photos(
     q: str = "",
     limit: int = 60,
     offset: int = 0,
-    kind: str = "",
     p: dict = Depends(current_principal),
 ):
     return media_index.search_media(
         q,
         limit=limit,
         offset=offset,
-        kind=kind or None,
         **_scope_kwargs(p),
     )
 
 
 @app.get("/api/dedup")
-def dedup_list(limit: int = 100, p: dict = Depends(require_settings)):
+def dedup_list(limit: int = 500, p: dict = Depends(require_settings)):
     from .services import ops
-    return ops.list_duplicate_groups(limit=limit)
+    from .services.dedup_scan import hash_coverage, public_state
+
+    cap = max(1, min(int(limit or 500), 500))
+    data = ops.list_duplicate_groups(limit=cap)
+    cov = hash_coverage()
+    data["missing"] = cov["missing"]
+    data["hashed"] = cov["hashed"]
+    data["total"] = cov["total"]
+    data["needs_rehash"] = cov["needs_rehash"]
+    data["scan"] = public_state()
+    if len(data.get("groups") or []) >= cap:
+        data["truncated"] = True
+    return data
+
+
+@app.get("/api/dedup/scan")
+def dedup_scan_status(p: dict = Depends(require_settings)):
+    from .services.dedup_scan import hash_coverage, public_state
+
+    snap = public_state()
+    cov = hash_coverage()
+    return {
+        "ok": True,
+        "running": snap.get("running"),
+        "done": snap.get("done") or 0,
+        "updated": snap.get("updated") or 0,
+        "failed": snap.get("failed") or 0,
+        "error": snap.get("error"),
+        "finished_at": snap.get("finished_at"),
+        **cov,
+    }
 
 
 @app.post("/api/dedup/scan")
-def dedup_scan(body: DedupScan = Body(default_factory=DedupScan), p: dict = Depends(require_settings)):
-    """补算或按 nometa 算法重算 content_hash（忽略 EXIF/容器元数据）。"""
-    from .services.ops import content_hash_of
-    from .services.library import album_path
-    from .services.naming import CONTENT_HASH_ALGO
+def dedup_scan(force: bool = False, p: dict = Depends(require_settings)):
+    """后台补算或按去元数据内容重算指纹。"""
+    from .services.dedup_scan import hash_coverage, public_state, start_dedup_scan
 
-    force = bool(body.force)
-    algo = media_index.content_hash_algo_state()
-    if algo.get("needs_rehash"):
+    cov = hash_coverage()
+    if cov["needs_rehash"]:
         force = True
-    coverage = media_index.content_hash_coverage()
-    if not force and coverage.get("missing", 0) <= 0:
-        return {
-            "ok": True,
-            "filled": 0,
-            "skipped": 0,
-            "total": coverage.get("total", 0),
-            "hashed": coverage.get("hashed", 0),
-            "missing": 0,
-            "hash_algo": CONTENT_HASH_ALGO,
-            "needs_rehash": False,
-            "message": f"指纹已齐全（{coverage.get('hashed', 0)}/{coverage.get('total', 0)}），直接读库比对",
-        }
+    if not force and cov["missing"] <= 0:
+        st = public_state()
+        st.update({"ok": True, "started": False, "message": "指纹已齐全", **cov})
+        return st
+    started = start_dedup_scan(force=force)
+    started.update(hash_coverage())
+    return started
 
-    filled = 0
-    skipped = 0
-    with media_index.connect() as con:
-        if force:
-            rows = con.execute("SELECT path FROM media").fetchall()
-        else:
-            rows = con.execute(
-                "SELECT path FROM media WHERE content_hash IS NULL OR TRIM(content_hash) = ''"
-            ).fetchall()
-    for r in rows:
-        rel = r["path"]
-        try:
-            full = album_path(rel)
-            if not full.is_file():
-                skipped += 1
-                continue
-            h = content_hash_of(full)
-            media_index.set_content_hash(rel, h)
-            filled += 1
-        except Exception:
-            skipped += 1
-    media_index.set_content_hash_algo(CONTENT_HASH_ALGO)
-    coverage2 = media_index.content_hash_coverage()
-    return {
-        "ok": True,
-        "filled": filled,
-        "skipped": skipped,
-        "total": coverage2.get("total", 0),
-        "hashed": coverage2.get("hashed", 0),
-        "missing": coverage2.get("missing", 0),
-        "hash_algo": CONTENT_HASH_ALGO,
-        "needs_rehash": False,
-        "message": (
-            f"已按去元数据内容重算 {filled} 条指纹（{coverage2.get('hashed', 0)}/{coverage2.get('total', 0)}）"
-            if force
-            else f"已补算 {filled} 条，当前指纹 {coverage2.get('hashed', 0)}/{coverage2.get('total', 0)}"
-        ),
-    }
 
 @app.post("/api/dedup/resolve")
 def dedup_resolve(body: DedupResolve, p: dict = Depends(require_settings)):
@@ -1111,7 +1119,7 @@ def dedup_resolve_all(body: DedupResolveAll = DedupResolveAll(), p: dict = Depen
     strategy = (body.strategy or "oldest").lower()
     if strategy not in ("oldest", "newest"):
         raise HTTPException(400, "strategy 须为 oldest 或 newest")
-    data = ops.list_duplicate_groups(limit=200)
+    data = ops.list_duplicate_groups(limit=500)
     kept = 0
     trashed = 0
     details = []
@@ -1168,14 +1176,12 @@ def timeline_month(
     month: str,
     limit: int = 200,
     offset: int = 0,
-    kind: str = "",
     p: dict = Depends(current_principal),
 ):
     return library.timeline_month(
         month,
         limit=limit,
         offset=offset,
-        kind=kind or None,
         **_scope_kwargs(p),
     )
 
@@ -1184,13 +1190,11 @@ def timeline_month(
 def timeline_paths(
     year: str | None = None,
     month: str | None = None,
-    kind: str = "",
     p: dict = Depends(current_principal),
 ):
     return library.timeline_paths(
         year=year,
         month=month,
-        kind=kind or None,
         **_scope_kwargs(p),
     )
 
@@ -1248,7 +1252,6 @@ def map_clusters(
     east: float | None = None,
     north: float | None = None,
     limit: int = 800,
-    kind: str = "",
     p: dict = Depends(current_principal),
 ):
     data = library.map_clusters(
@@ -1258,7 +1261,6 @@ def map_clusters(
         east=east,
         north=north,
         limit=limit,
-        kind=kind or None,
         **_scope_kwargs(p),
     )
     provider = offline_map.effective_provider()
@@ -1338,10 +1340,34 @@ def map_photos(p: dict = Depends(current_principal)):
     return data
 
 
+def _photo_from_index(path: str) -> dict | None:
+    row = media_index.indexed_photo(path)
+    if not row or row.get("kind") == "video":
+        return None
+    try:
+        full = library.album_path(path)
+        narr = library.narration_file(full)
+        if narr and narr.is_file():
+            row["has_audio"] = True
+            row["audio_path"] = str(narr.relative_to(config.album_root)).replace("\\", "/")
+        from .services.ops import live_video_for
+
+        live = live_video_for(full)
+        if live is not None:
+            row["has_live"] = True
+            row["live_video_path"] = str(live.relative_to(config.album_root)).replace("\\", "/")
+    except Exception:
+        pass
+    return row
+
+
 @app.get("/api/photo")
 def photo(path: str, p: dict = Depends(current_principal)):
     try:
         path = _guard_album_path(path, p)
+        cached = _photo_from_index(path)
+        if cached:
+            return cached
         return library.get_photo(path)
     except FileNotFoundError:
         raise HTTPException(404, "照片不存在")
@@ -1520,59 +1546,6 @@ def file_raw(path: str, source: str = "album", p: dict = Depends(current_princip
         raise HTTPException(400, str(e))
 
 
-@app.get("/api/play")
-async def play_video(
-    path: str,
-    source: str = "album",
-    client_hevc: int = 0,
-    client_h264: int = 0,
-    max_h: int = 0,
-    p: dict = Depends(current_principal),
-):
-    """浏览器可播视频：原生兼容则直出原件，否则 remux/转码为 H.264+AAC MP4（落盘缓存）。
-
-    client_hevc/client_h264：前端 canPlayType 探测结果，能本机解码则跳过树莓派转码。
-    max_h：手机传 720，缩短首次转码。
-    """
-    try:
-        if source == "import":
-            if not p.get("can_upload"):
-                raise HTTPException(403, "无权访问导入文件")
-        else:
-            path = _guard_album_path(path, p)
-        if max_h in (480, 720, 1080):
-            height = max_h
-        else:
-            height = 720 if source == "import" else 1080
-        hevc = bool(client_hevc)
-        h264 = bool(client_h264)
-
-        def _prep():
-            return library.ensure_playable(
-                path,
-                source,
-                height,
-                client_hevc=hevc,
-                client_h264=h264,
-            )
-
-        fp = await run_in_threadpool(_prep)
-        if not fp.exists():
-            raise HTTPException(404, "文件不存在")
-        media_type, _ = mimetypes.guess_type(str(fp))
-        return FileResponse(
-            fp,
-            media_type=media_type or "video/mp4",
-            headers={"Cache-Control": "private, max-age=3600"},
-        )
-    except FileNotFoundError:
-        raise HTTPException(404, "文件不存在")
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-    except RuntimeError as e:
-        raise HTTPException(500, str(e))
-
-
 
 @app.get("/api/download")
 def download_file(path: str, source: str = "album", p: dict = Depends(current_principal)):
@@ -1616,77 +1589,19 @@ def photo_cover(path: str, body: CoverUpdate, p: dict = Depends(require_edit)):
         raise HTTPException(400, str(e))
 
 
-@app.get("/api/photo/audio")
-def photo_audio_get(path: str, p: dict = Depends(current_principal)):
-    """按照片路径取旁白文件（不要用 /api/file 走伴生名，MIME 更稳）。"""
-    try:
-        path = _guard_album_path(path, p)
-        src = library.album_path(path)
-        narr = library.ensure_narration_m4a(src) or library.narration_file(src)
-        if not narr or not narr.is_file():
-            raise HTTPException(404, "没有旁白")
-        suf = narr.suffix.lower()
-        media_type = {
-            ".m4a": "audio/mp4",
-            ".mp4": "audio/mp4",
-            ".aac": "audio/aac",
-            ".mp3": "audio/mpeg",
-            ".ogg": "audio/ogg",
-            ".wav": "audio/wav",
-            ".webm": "audio/webm",
-        }.get(suf, "audio/mp4")
-        return FileResponse(
-            narr,
-            media_type=media_type,
-            headers={
-                "Cache-Control": "private, max-age=30",
-                "Accept-Ranges": "bytes",
-            },
-        )
-    except HTTPException:
-        raise
-    except FileNotFoundError:
-        raise HTTPException(404, "照片不存在")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
 @app.post("/api/photo/audio")
 async def photo_audio_upload(
-    path: str, request: Request, p: dict = Depends(require_narration_write)
+    path: str, file: UploadFile = File(...), p: dict = Depends(require_edit)
 ):
-    """为图片保存旁白音频（原始字节 / multipart / JSON base64）。"""
+    """为图片保存旁白音频（webm/m4a 等）。"""
     try:
         path = _guard_album_path(path, p)
-        ct = (request.headers.get("content-type") or "").lower()
-        data = b""
-        filename = request.headers.get("x-narration-filename") or "narration.m4a"
-        if "application/json" in ct:
-            body = await request.json()
-            raw = body.get("data_b64") or ""
-            try:
-                data = base64.b64decode(raw)
-            except Exception:
-                raise HTTPException(400, "旁白数据无法解码")
-            filename = str(body.get("filename") or filename)
-        elif "multipart/form-data" in ct:
-            form = await request.form()
-            up = form.get("file")
-            if up is None:
-                raise HTTPException(400, "没有收到录音文件")
-            data = await up.read()
-            filename = getattr(up, "filename", None) or filename
-        else:
-            data = await request.body()
-            if not filename:
-                filename = "narration.bin"
-        if not data or len(data) < 64:
-            raise HTTPException(400, "录音是空的，请再录几秒后保存")
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "空音频")
         if len(data) > 20 * 1024 * 1024:
             raise HTTPException(400, "旁白请小于 20MB")
-        return library.save_narration(path, data, filename=filename)
-    except HTTPException:
-        raise
+        return library.save_narration(path, data, filename=file.filename)
     except FileNotFoundError:
         raise HTTPException(404, "照片不存在")
     except ValueError as e:
@@ -1696,7 +1611,7 @@ async def photo_audio_upload(
 
 
 @app.delete("/api/photo/audio")
-def photo_audio_delete(path: str, p: dict = Depends(require_narration_write)):
+def photo_audio_delete(path: str, p: dict = Depends(require_edit)):
     try:
         path = _guard_album_path(path, p)
         return library.delete_narration(path)

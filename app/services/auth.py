@@ -5,7 +5,6 @@ import hashlib
 import json
 import secrets
 import sqlite3
-import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +15,7 @@ from ..config import ROOT
 DB_PATH = ROOT / "data" / "auth.sqlite"
 SESSION_COOKIE = "xiaoshu_session"
 SESSION_DAYS = 30
-PBKDF2_ITERS = 80_000
+PBKDF2_ITERS = 120_000
 
 
 def _now() -> datetime:
@@ -110,10 +109,17 @@ def init_db() -> None:
             )
 
 
+_HAS_ADMIN: bool | None = None
+
+
 def has_admin() -> bool:
+    global _HAS_ADMIN
+    if _HAS_ADMIN:
+        return True
     with connect() as con:
         row = con.execute("SELECT 1 FROM admin WHERE id = 1").fetchone()
-        return bool(row)
+    _HAS_ADMIN = bool(row)
+    return _HAS_ADMIN
 
 
 def setup_admin(username: str, password: str) -> dict:
@@ -127,6 +133,8 @@ def setup_admin(username: str, password: str) -> dict:
             "INSERT INTO admin (id, username, password_hash, created_at, updated_at) VALUES (1,?,?,?,?)",
             (username, _hash_password(password), now, now),
         )
+    global _HAS_ADMIN
+    _HAS_ADMIN = True
     return {"ok": True, "username": username, "message": "超级用户已创建"}
 
 
@@ -248,24 +256,23 @@ def _parse_scopes(raw: str | None) -> list[str]:
 
 
 def get_principal(session_token: str | None) -> dict[str, Any]:
-    """返回当前身份能力。无会话且未建管理员 → 视为本机开放模式（兼容旧用法）。"""
-    open_mode = not has_admin()
-    # 已启用超管后：未登录访客默认不可浏览任何媒资（须走分享会话）
-    deny_paths = [] if open_mode else ["__none__"]
+    """返回当前身份。未建超级用户时不开放任何相册权限，必须先注册。"""
+    needs_setup = not has_admin()
+    # 未登录、或尚未创建超级用户：不可浏览任何媒资
     base = {
         "authenticated": False,
         "kind": "anonymous",
         "username": None,
         "is_admin": False,
-        "can_edit": open_mode,
-        "can_upload": open_mode,
-        "can_settings": open_mode,
-        "can_trash": open_mode,
-        "can_purge": open_mode,
-        "album_scopes": [],  # 空 = 全部（仅 open_mode / 超管）
-        "media_paths": deny_paths,  # 非空 = 仅这些文件；__none__ 表示拒绝全部
-        "needs_setup": open_mode,
-        "open_mode": open_mode,
+        "can_edit": False,
+        "can_upload": False,
+        "can_settings": False,
+        "can_trash": False,
+        "can_purge": False,
+        "album_scopes": [],
+        "media_paths": ["__none__"],
+        "needs_setup": needs_setup,
+        "open_mode": False,
         "share_label": None,
     }
     if not session_token:
@@ -534,26 +541,15 @@ def _share_dict(row: sqlite3.Row) -> dict:
     }
 
 
-_qr_cache: dict[str, tuple[float, bytes]] = {}
-
-
-def qr_png_bytes(text: str, box_size: int = 5) -> bytes:
+def qr_png_bytes(text: str, box_size: int = 6) -> bytes:
     import io
 
     import qrcode
 
-    now = time.time()
-    hit = _qr_cache.get(text)
-    if hit and now - hit[0] < 3600:
-        return hit[1]
     qr = qrcode.QRCode(version=None, box_size=box_size, border=2)
     qr.add_data(text)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    data = buf.getvalue()
-    if len(_qr_cache) > 64:
-        _qr_cache.clear()
-    _qr_cache[text] = (now, data)
-    return data
+    return buf.getvalue()

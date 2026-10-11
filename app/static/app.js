@@ -1788,6 +1788,45 @@ function wireImportRow(row, list) {
       row
     );
   });
+  row.querySelectorAll(".dup-jump-thumb").forEach((img) => {
+    img.addEventListener("error", () => {
+      img.hidden = true;
+    });
+  });
+  row.querySelector(".dup-badge")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const toggle = e.currentTarget;
+    const panel = row.querySelector(".dup-where");
+    if (!panel) return;
+    const open = toggle.getAttribute("aria-expanded") !== "true";
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    panel.classList.toggle("hidden", !open);
+    if (open) {
+      panel.querySelectorAll("img[data-src]").forEach((img) => {
+        if (!img.getAttribute("src")) img.src = img.dataset.src || "";
+      });
+    }
+  });
+  row.querySelectorAll(".dup-jump").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const path = btn.dataset.dupPath || "";
+      if (!path) return;
+      if (btn.dataset.dupKind === "album") {
+        openLightbox(path, [path]);
+        return;
+      }
+      const target = importListRoot()?.querySelector(
+        `.import-item[data-path="${CSS.escape(path)}"]`
+      );
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      target.classList.add("dup-flash");
+      setTimeout(() => target.classList.remove("dup-flash"), 1600);
+    });
+  });
 }
 
 function rememberImportPreviewSpot(row) {
@@ -1839,7 +1878,7 @@ async function openImportMediaPreview(path, kind, name, row = null) {
     dlg.innerHTML = `
       <div class="import-media-head">
         <strong id="import-media-title">预览</strong>
-        <button type="button" class="btn ghost" id="import-media-close" aria-label="关闭">关闭</button>
+        <button type="button" class="import-media-close" id="import-media-close" aria-label="关闭">关闭</button>
       </div>
       <div class="import-media-body" id="import-media-body"></div>`;
     document.body.appendChild(dlg);
@@ -1885,9 +1924,14 @@ async function openImportMediaPreview(path, kind, name, row = null) {
   }
   const img = document.createElement("img");
   img.alt = name || "";
-  img.src = `/api/preview?source=import&path=${encodeURIComponent(path)}&size=${lightboxPreviewSize()}`;
+  const importPreview = (size) =>
+    `/api/preview?source=import&path=${encodeURIComponent(path)}&size=${size}`;
+  img.src = importPreview(lightboxPreviewSize());
   img.onerror = () => {
-    img.src = `/api/file?source=import&path=${encodeURIComponent(path)}`;
+    img.onerror = () => {
+      img.alt = "这张图暂时打不开";
+    };
+    img.src = importPreview(640);
   };
   body.appendChild(img);
   if (typeof dlg.showModal === "function") dlg.showModal();
@@ -1907,6 +1951,89 @@ function closeImportMediaPreview() {
   else dlg.removeAttribute("open");
   const body = $("#import-media-body");
   if (body) body.innerHTML = "";
+}
+
+function formatDupLocation(rel, kind) {
+  const norm = String(rel || "").replace(/\\/g, "/");
+  const parts = norm.split("/").filter(Boolean);
+  const file = parts.length ? parts[parts.length - 1] : norm;
+  const folders = parts.slice(0, -1);
+  const stem = file.replace(/\.[^.]+$/, "");
+  let when = "";
+  let title = "";
+  const named = stem.match(/^(\d{4}-\d{2}-\d{2})-(\d{6})-(.+)-([0-9a-f]{8})(?:-\d+)?$/i);
+  if (named) {
+    const t = named[2];
+    when = `${named[1]} ${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
+    title = named[3];
+  } else {
+    const dated = stem.match(/^(\d{4}-\d{2}-\d{2})-(.+)$/);
+    if (dated) {
+      when = dated[1];
+      title = dated[2].replace(/-\d+$/, "");
+    }
+  }
+  const place = folders.join(" / ");
+  if (kind !== "album") {
+    return {
+      path: norm,
+      file,
+      headline: place ? `待入库 · ${place}` : "待入库列表",
+    };
+  }
+  const headline = [place, when, title].filter(Boolean).join(" · ") || file;
+  return { path: norm, file, headline };
+}
+
+function dupJumpButton(kind, rel) {
+  const loc = formatDupLocation(rel, kind);
+  const thumb =
+    kind === "album"
+      ? `<img class="dup-jump-thumb" alt="" data-src="/api/preview?source=album&path=${encodeURIComponent(loc.path)}&size=120" />`
+      : "";
+  const action = kind === "album" ? "在相册中打开" : "定位到这项";
+  return `<button type="button" class="dup-jump" data-dup-kind="${kind}" data-dup-path="${escapeAttr(loc.path)}">
+    ${thumb}
+    <span class="dup-jump-text">
+      <strong>${escapeHtml(loc.headline)}</strong>
+      <em>${escapeHtml(loc.file)}</em>
+      <span class="dup-jump-action">${action}</span>
+    </span>
+  </button>`;
+}
+
+function renderDupBlock(it) {
+  const album = Array.isArray(it.duplicate_of) ? it.duplicate_of.filter(Boolean) : [];
+  const inbox = Array.isArray(it.inbox_duplicate_of) ? it.inbox_duplicate_of.filter(Boolean) : [];
+  if (it.duplicate) {
+    const n = album.length;
+    const label = n > 1 ? `相册已有相同内容（${n} 处）` : "相册已有相同内容";
+    const albumHtml = n
+      ? album.map((p) => dupJumpButton("album", p)).join("")
+      : `<p class="dup-where-title">已标记为重复，但没读到相册路径。点「重新解析」后再看。</p>`;
+    const inboxHtml = inbox.length
+      ? `<p class="dup-where-title">待入库里还有</p>${inbox.map((p) => dupJumpButton("inbox", p)).join("")}`
+      : "";
+    return `<button type="button" class="dup-badge" aria-expanded="false">${escapeHtml(label)}<span class="dup-caret"></span></button>
+      <div class="dup-where hidden">
+        <p class="dup-where-title">相同内容在相册中的位置</p>
+        ${albumHtml}
+        ${inboxHtml}
+      </div>`;
+  }
+  if (it.inbox_duplicate) {
+    const n = inbox.length;
+    const label = n > 1 ? `待入库内重复（${n} 处）` : "待入库内重复";
+    const body = n
+      ? inbox.map((p) => dupJumpButton("inbox", p)).join("")
+      : `<p class="dup-where-title">已标记为重复，但没读到另一项的位置。</p>`;
+    return `<button type="button" class="dup-badge inbox" aria-expanded="false">${escapeHtml(label)}<span class="dup-caret"></span></button>
+      <div class="dup-where hidden">
+        <p class="dup-where-title">待入库里的相同项</p>
+        ${body}
+      </div>`;
+  }
+  return "";
 }
 
 function buildImportRow(it) {
@@ -1940,19 +2067,15 @@ function buildImportRow(it) {
       ${badge}
     </button>`;
   }
-  let badge = it.live_companion
+  const kindBadge = it.live_companion
     ? `<span class="live-badge">实况伴生 · 随同名 HEIC 入库</span>`
     : heic
       ? `<span class="live-badge heic">HEIC 原件</span>`
       : kind === "video"
         ? `<span class="live-badge">视频</span>`
         : "";
-  if (it.duplicate) {
-    const of = (it.duplicate_of && it.duplicate_of[0]) || "";
-    badge += `<span class="dup-badge" title="${escapeAttr(of)}">相册已有相同内容</span>`;
-  } else if (it.inbox_duplicate) {
-    badge += `<span class="dup-badge inbox">待入库内重复</span>`;
-  }
+  const dupBlock = renderDupBlock(it);
+  const badges = kindBadge || dupBlock ? `<div class="import-badges">${kindBadge}${dupBlock}</div>` : "";
   const liveDis = it.live_companion ? "disabled" : "";
   row.innerHTML = `
     <label class="import-pick" title="选中入库">
@@ -1961,7 +2084,7 @@ function buildImportRow(it) {
     ${preview}
     <div class="import-fields">
       <div class="import-file-name" title="${escapeAttr(it.name)}">${escapeAttr(it.name)}</div>
-      ${badge}
+      ${badges}
       <label>时间 <input type="datetime-local" class="f-datetime" value="${escapeAttr(row.dataset.datetime)}" ${liveDis} /></label>
       <label>简述 <input type="text" class="f-title" maxlength="30" value="${escapeAttr(row.dataset.title)}" ${liveDis} /></label>
     </div>`;
@@ -2817,11 +2940,28 @@ function isMobileClient() {
   return /iPhone|iPad|iPod|Android|Mobile/i.test(ua) || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(ua));
 }
 
+/** macOS 上的 Safari（不含 iPad 桌面模式、不含 Chrome） */
+function isMacSafari() {
+  const ua = navigator.userAgent || "";
+  if (!/Macintosh|Mac OS X/.test(ua)) return false;
+  if (/Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS|Android/.test(ua)) return false;
+  if (navigator.maxTouchPoints > 1) return false;
+  return /Safari/.test(ua);
+}
+
 /** 手机看图用更小预览，减轻树莓派生成与蜂窝/Wi‑Fi 传输 */
 function lightboxPreviewSize() {
-  if (isMobileClient()) return 640;
+  // 手机幻灯片也用已备好的 1600。另要 1280 会现场重解码，画面就停在很小的缩略图上。
+  if (isMobileClient()) return 1600;
   if (lb.playing) return 1280;
   return 1600;
+}
+
+function isMacDesktop() {
+  const ua = navigator.userAgent || "";
+  if (!/Macintosh|Mac OS X/.test(ua)) return false;
+  if (navigator.maxTouchPoints > 1) return false;
+  return true;
 }
 
 function albumThumbSize() {
@@ -2850,6 +2990,68 @@ function setupImportMobileUX() {
         "点「从相册选择」多选上传；支持 HEIC / 实况 / MOV。上传后勾选再入库。";
     }
   }
+  const fileInput = $("#file-input");
+  if (fileInput && isMacDesktop()) {
+    // accept 里写 .heic 等扩展名时，Safari 打不开 macOS「照片」图库
+    fileInput.setAttribute("accept", "image/*,video/*");
+    if (!mobile && sub) {
+      sub.textContent =
+        "点「从相册选择」：Chrome 会打开「图片」文件夹（照片图库在这里）。Safari 请在窗口左侧点「照片」，即可勾选图片和视频。";
+    }
+    if (!mobile && hint) {
+      hint.textContent =
+        "Mac 入库：从相册选择后，在左侧进入「照片」或「图片」里的照片图库，勾选图片/视频再上传。也可直接从「照片」App 拖到这里。";
+    }
+  }
+}
+
+function bindMacPhotoPicker() {
+  const btn = $("#btn-pick-files");
+  if (!btn || btn.dataset.macPicker === "1" || !isMacDesktop()) return;
+  if (typeof window.showOpenFilePicker !== "function") return;
+  btn.dataset.macPicker = "1";
+  btn.addEventListener(
+    "click",
+    (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      let pending;
+      try {
+        pending = window.showOpenFilePicker({
+          multiple: true,
+          startIn: "pictures",
+          types: [
+            {
+              description: "照片和视频",
+              accept: {
+                "image/*": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".avif"],
+                "video/*": [".mp4", ".mov", ".m4v", ".webm", ".mkv"],
+              },
+            },
+          ],
+        });
+      } catch (_) {
+        $("#file-input")?.click();
+        return;
+      }
+      pending
+        .then(async (handles) => {
+          const files = [];
+          for (const handle of handles || []) {
+            try {
+              const file = await handle.getFile();
+              if (file) files.push(file);
+            } catch (_) {}
+          }
+          onPicked({ files, value: "" });
+        })
+        .catch((err) => {
+          if (err && err.name === "AbortError") return;
+          $("#file-input")?.click();
+        });
+    },
+    true
+  );
 }
 
 const UPLOAD_HIST_KEY = "xiaoshu_upload_dirs_v1";
@@ -3541,13 +3743,6 @@ if (zone) {
     }
   });
 }
-
-$("#btn-pick-files")?.addEventListener("click", () => {
-  $("#file-input")?.click();
-});
-$("#btn-pick-dir")?.addEventListener("click", () => {
-  $("#dir-input")?.click();
-});
 
 function revealImportUploadView() {
   const switched = state.section !== "manage" || state.manageTab !== "import";
@@ -4631,8 +4826,74 @@ function lbToggleAutoplay() {
   else lbStartAutoplay();
 }
 
+/** 手机浏览器的可视区域比 100vh 矮，且页面滚动后 dialog 会整框上移，顶栏被推出屏幕 */
+function lbSyncFrame() {
+  if (!lbDialog) return;
+  if (!lbDialog.open || !isMobileClient()) {
+    lbDialog.style.top = "";
+    lbDialog.style.left = "";
+    lbDialog.style.width = "";
+    lbDialog.style.height = "";
+    lbDialog.style.maxWidth = "";
+    lbDialog.style.maxHeight = "";
+    lbDialog.style.removeProperty("--lb-h");
+    return;
+  }
+  const vv = window.visualViewport;
+  const top = vv ? vv.offsetTop : 0;
+  const left = vv ? vv.offsetLeft : 0;
+  const width = vv ? vv.width : window.innerWidth;
+  const height = vv ? vv.height : window.innerHeight;
+  lbDialog.style.top = `${top}px`;
+  lbDialog.style.left = `${left}px`;
+  lbDialog.style.width = `${width}px`;
+  lbDialog.style.height = `${height}px`;
+  lbDialog.style.maxWidth = `${width}px`;
+  lbDialog.style.maxHeight = `${height}px`;
+  lbDialog.style.setProperty("--lb-h", `${height}px`);
+}
+
+let lbViewportBound = false;
+function lbBindViewport() {
+  lbSyncFrame();
+  if (lbViewportBound) return;
+  lbViewportBound = true;
+  window.visualViewport?.addEventListener("resize", lbSyncFrame);
+  window.visualViewport?.addEventListener("scroll", lbSyncFrame);
+  window.addEventListener("orientationchange", lbSyncFrame);
+}
+
+function lbUnbindViewport() {
+  window.visualViewport?.removeEventListener("resize", lbSyncFrame);
+  window.visualViewport?.removeEventListener("scroll", lbSyncFrame);
+  window.removeEventListener("orientationchange", lbSyncFrame);
+  lbViewportBound = false;
+  if (!lbDialog) return;
+  lbDialog.style.top = "";
+  lbDialog.style.left = "";
+  lbDialog.style.width = "";
+  lbDialog.style.height = "";
+  lbDialog.style.maxWidth = "";
+  lbDialog.style.maxHeight = "";
+  lbDialog.style.removeProperty("--lb-h");
+}
+
 function lbApplyTransform() {
   if (!lbStage) return;
+  const fit = isMobileClient() && lb.zoom <= 1.01 && !lb.panX && !lb.panY;
+  lbDialog?.classList.toggle("is-fit", fit);
+  if (fit) {
+    lbStage.style.left = "0";
+    lbStage.style.top = "0";
+    lbStage.style.width = "100%";
+    lbStage.style.height = "100%";
+    lbStage.style.transform = "none";
+    return;
+  }
+  lbStage.style.left = "";
+  lbStage.style.top = "";
+  lbStage.style.width = "";
+  lbStage.style.height = "";
   lbStage.style.transform = `translate(calc(-50% + ${lb.panX}px), calc(-50% + ${lb.panY}px)) scale(${lb.zoom})`;
 }
 
@@ -4702,6 +4963,7 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   const hint = hintMeta || {};
   const hintVid = hint.kind === "video" || isVideoName(path);
   lb.kind = hintVid ? "video" : "image";
+  lbDialog?.classList.toggle("is-video", hintVid);
   lbImg.classList.toggle("hidden", lb.kind === "video");
   lbVideo.classList.toggle("hidden", lb.kind !== "video");
   $("#lb-hint").textContent = lb.playing
@@ -4714,36 +4976,37 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   if (opts.withFx) await lbRunFxPrep(dir);
 
   const bust = state.thumbBust || 0;
-  // 手机用 960：生成/传输更快；电脑手动看图 1600，幻灯片略小
   const previewSize = lightboxPreviewSize();
   const thumbUrl = `/api/thumb?path=${encodeURIComponent(path)}&size=${albumThumbSize()}&_=${bust}`;
   const midUrl = `/api/thumb?path=${encodeURIComponent(path)}&size=${isMobileClient() ? 480 : 640}&_=${bust}`;
   const previewUrl = `/api/preview?path=${encodeURIComponent(path)}&size=${previewSize}&_=${bust}`;
+  const imgToken = (lb.imgToken = (lb.imgToken || 0) + 1);
 
+  // 先在屏幕外解码，成功后再换到画面上。直接改 img.src 时，手机常把上一次被中断的请求当成失败。
   const applyUrl = (url) =>
     new Promise((resolve) => {
-      if (!lbImg) return resolve(false);
-      const finish = (ok) => {
-        lbImg.removeEventListener("load", onLoad);
-        lbImg.removeEventListener("error", onErr);
-        lbImg.style.opacity = "1";
-        resolve(ok);
-      };
-      const onLoad = () => finish(true);
-      const onErr = () => finish(false);
+      if (!lbImg || !url) return resolve(false);
       try {
         const abs = new URL(url, location.origin).href;
         if (lbImg.src === abs && lbImg.complete && lbImg.naturalWidth > 0) {
-          finish(true);
-          return;
+          lbImg.style.opacity = "1";
+          return resolve(true);
         }
       } catch (_) {}
-      lbImg.addEventListener("load", onLoad, { once: true });
-      lbImg.addEventListener("error", onErr, { once: true });
-      lbImg.src = url;
+      const im = new Image();
+      im.onload = () => {
+        if (imgToken !== lb.imgToken || state.galleryPaths[state.galleryIndex] !== path) {
+          resolve(false);
+          return;
+        }
+        lbImg.src = url;
+        lbImg.style.opacity = "1";
+        resolve(true);
+      };
+      im.onerror = () => resolve(false);
+      im.src = url;
     });
 
-  // 图片：先展示缩略/中图，大图与 meta 并行，缩短「空白等待」
   if (!hintVid) {
     lbImg.style.opacity = "0.55";
     const cached = lbPreviewCacheGet(previewUrl) || lbPreviewCacheGet(midUrl);
@@ -4752,8 +5015,6 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
       lbImg.style.opacity = "1";
     } else {
       lbImg.src = thumbUrl;
-      // 尽快升到 640，观感比干等 1600 好
-      void applyUrl(midUrl);
     }
   }
 
@@ -4763,25 +5024,25 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
   try {
     const photoPromise = api(`/api/photo?path=${encodeURIComponent(path)}`);
     const videoBindP = hintVid ? bindLightboxVideo(lbVideo, path, "album") : null;
-    if (!hintVid) {
-      const upgradePreview = () => {
-        void lbPreloadImage(previewUrl).then(async (ok) => {
-          if (state.galleryPaths[state.galleryIndex] !== path) return;
-          if (ok) {
+    if (!hintVid && imgToken === lb.imgToken) {
+      const sharpen = async () => {
+        if (imgToken !== lb.imgToken || state.galleryPaths[state.galleryIndex] !== path) return;
+        if (isMobileClient() || lbPreviewCacheGet(previewUrl)) {
+          const okPrev = await applyUrl(previewUrl);
+          if (okPrev) {
             lbPreviewCachePut(previewUrl);
-            await applyUrl(previewUrl);
+            return;
           }
-        });
+        }
+        if (!lbPreviewCacheGet(midUrl)) {
+          const okMid = await applyUrl(midUrl);
+          if (okMid) lbPreviewCachePut(midUrl);
+        }
+        if (imgToken !== lb.imgToken || state.galleryPaths[state.galleryIndex] !== path) return;
+        const okPrev = await applyUrl(previewUrl);
+        if (okPrev) lbPreviewCachePut(previewUrl);
       };
-      // 手机先看中图，大图稍后再升清，避免卡在生成预览
-      if (isMobileClient() && !lb.playing) {
-        setTimeout(() => {
-          if (state.galleryPaths[state.galleryIndex] !== path) return;
-          upgradePreview();
-        }, 320);
-      } else {
-        upgradePreview();
-      }
+      void sharpen();
     }
 
     const data = await photoPromise;
@@ -4792,6 +5053,7 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
     lb.hasAudio = Boolean(data.has_audio && (data.audio_path || data.has_audio));
     lb.audioUrl = lb.hasAudio ? narrationFetchUrl(path) : null;
     lb.audioDuration = data.audio_duration != null ? Number(data.audio_duration) : null;
+    lbDialog?.classList.toggle("is-video", kind === "video");
     lbImg.classList.toggle("hidden", kind === "video");
     lbVideo.classList.toggle("hidden", kind !== "video");
     $("#lb-title").textContent =
@@ -4810,12 +5072,17 @@ async function lbShowCurrent(hintMeta = null, opts = {}) {
       lbVideo.load();
       if (!(lbImg.complete && lbImg.naturalWidth > 0)) {
         const okMid = await applyUrl(midUrl);
-        if (!okMid) {
+        const okPrev = okMid ? true : await applyUrl(previewUrl);
+        // 手机放不下单反原片，塞进图片标签会解码失败，看图只用预览档
+        if (!okMid && !okPrev && !isMobileClient()) {
           const okFile = await applyUrl(fileUrl);
           if (!okFile) {
             $("#lb-title").textContent = "图片加载失败";
             lbImg.style.opacity = "1";
           }
+        } else if (!okMid && !okPrev) {
+          $("#lb-title").textContent = "图片加载失败";
+          lbImg.style.opacity = "1";
         }
       }
       lbSetupLive(data);
@@ -4968,6 +5235,11 @@ function openLightbox(path, paths = null, hintMeta = null) {
   lbStopAutoplay();
   $("#lb-play-panel")?.classList.add("hidden");
   if (!lbDialog.open) lbDialog.showModal();
+  lbBindViewport();
+  requestAnimationFrame(() => {
+    lbSyncFrame();
+    requestAnimationFrame(lbSyncFrame);
+  });
   lbShowCurrent(hintMeta).catch(console.error);
 }
 
@@ -5005,8 +5277,16 @@ function lbOpenEdit() {
   if (!path) return;
   lbStopAutoplay();
   state.reopenLightbox = true;
-  if (lbDialog.open) lbDialog.close();
-  openDetail(path).catch((e) => alert(e.message || e));
+  const open = () => {
+    openDetail(path).catch((e) => alert(e.message || e));
+  };
+  if (lbDialog?.open) {
+    lbDialog.close();
+    // Safari 在同一轮事件里关掉幻灯片再 showModal，编辑框高度会算错、下半截被裁掉
+    setTimeout(open, 0);
+    return;
+  }
+  open();
 }
 
 $("#lb-close")?.addEventListener("click", () => {
@@ -5059,6 +5339,7 @@ lbDialog?.addEventListener("cancel", () => {
 });
 lbDialog?.addEventListener("close", () => {
   lbStopAutoplay();
+  lbUnbindViewport();
   $("#lb-play-panel")?.classList.add("hidden");
 });
 
@@ -5197,8 +5478,20 @@ $("#detail-dialog")?.addEventListener("close", () => {
   );
   if (!path) return;
   const list = (state.galleryPaths || []).map(canonicalizeAlbumPath).filter(Boolean);
-  openLightbox(path, list.length ? list : [path]);
+  setTimeout(() => {
+    openLightbox(path, list.length ? list : [path]);
+  }, 0);
 });
+
+function setDetailPreview(path) {
+  const rel = encodeURIComponent(path);
+  const bust = Date.now();
+  imgEl.onerror = () => {
+    imgEl.onerror = null;
+    imgEl.src = `/api/preview?path=${rel}&size=640&t=${bust}`;
+  };
+  imgEl.src = `/api/preview?path=${rel}&size=1600&t=${bust}`;
+}
 
 async function openDetail(path, hintMeta = null) {
   const req = ++_detailReq;
@@ -5265,7 +5558,7 @@ async function openDetail(path, hintMeta = null) {
       videoEl.removeAttribute("src");
       videoEl.load();
       // 统一用预览 JPEG（落盘缓存）；原件仅下载时走 /api/file
-      imgEl.src = `/api/preview?path=${encodeURIComponent(path)}&size=1600&t=${Date.now()}`;
+      setDetailPreview(path);
       requestAnimationFrame(() => {
         computeFit();
         applyViewerTransform();
@@ -5391,7 +5684,7 @@ async function saveMetaOnly(opts = {}) {
     videoEl.src = mediaPlayUrl(state.currentPath);
     videoEl.load();
   } else {
-    imgEl.src = `/api/preview?path=${encodeURIComponent(state.currentPath)}&size=1600&t=${Date.now()}`;
+    setDetailPreview(state.currentPath);
   }
   if (refreshViews) {
     // 整库扫描较慢，放到微任务后，避免卡住弹窗确认按钮
@@ -5505,7 +5798,7 @@ $("#btn-save-confirm").addEventListener("click", async () => {
       videoEl.src = mediaPlayUrl(state.currentPath);
       videoEl.load();
     } else {
-      imgEl.src = `/api/preview?path=${encodeURIComponent(state.currentPath)}&size=1600&t=${Date.now()}`;
+      setDetailPreview(state.currentPath);
     }
     $("#save-mode-dialog").close();
     $("#detail-msg").textContent = (r.message || "已保存") + "；信息已同步";
@@ -5930,6 +6223,10 @@ async function refreshIndexStatus() {
 
 $("#btn-index-rebuild")?.addEventListener("click", async () => {
   const el = $("#index-status");
+  const ok = window.confirm(
+    "重建索引只重写数据库里的目录，不会删除或修改相册里的照片和视频。进行时浏览会变慢，可能要几分钟。确定开始？"
+  );
+  if (!ok) return;
   try {
     const r = await api("/api/index/rebuild", { method: "POST" });
     if (el) el.textContent = r.message || "已开始重建";
@@ -6768,23 +7065,20 @@ async function loadVisitorStats() {
   bindVisitorExpand();
   const msg = $("#visitor-msg");
   try {
-    const [sum, cur, hist, curve, hot, bl, uploadStats, uploads] = await Promise.all([
-      api("/api/visitors/summary"),
-      api("/api/visitors/current"),
-      api("/api/visitors/history?limit=80"),
-      api("/api/visitors/curve?days=14"),
-      api("/api/visitors/hot-media?limit=20"),
-      api("/api/visitors/blacklist"),
-      api("/api/visitors/uploads/stats"),
-      api("/api/visitors/uploads?limit=60"),
-    ]);
-    const sumEl = $("#visitor-summary");
-    if (sumEl) {
+    const sumEl0 = $("#visitor-summary");
+    if (sumEl0 && !sumEl0.querySelector(".visitor-stat")) {
+      sumEl0.className = "visitor-summary";
+      sumEl0.innerHTML = `<p class="muted">正在汇总…</p>`;
+    }
+    const sum = await api("/api/visitors/summary");
+    const paintSummary = (uploadTotal) => {
+      const sumEl = $("#visitor-summary");
+      if (!sumEl) return;
       const stats = [
         ["总访问", sum.total_visits || 0],
         ["独立 IP", sum.unique_ips || 0],
         ["今日", sum.today_visits || 0],
-        ["入库", sum.ingest_count || uploadStats.total || 0],
+        ["入库", uploadTotal != null ? uploadTotal : sum.ingest_count || 0],
         ["黑名单", sum.blacklist_count || 0],
       ];
       sumEl.className = "visitor-summary";
@@ -6798,7 +7092,18 @@ async function loadVisitorStats() {
         (sum.mac_note
           ? `<p class="muted visitor-summary-note">${escapeHtml(sum.mac_note)}</p>`
           : "");
-    }
+    };
+    paintSummary(null);
+    const [cur, hist, curve, hot, bl, uploadStats, uploads] = await Promise.all([
+      api("/api/visitors/current"),
+      api("/api/visitors/history?limit=80"),
+      api("/api/visitors/curve?days=14"),
+      api("/api/visitors/hot-media?limit=20"),
+      api("/api/visitors/blacklist"),
+      api("/api/visitors/uploads/stats"),
+      api("/api/visitors/uploads?limit=60"),
+    ]);
+    paintSummary(uploadStats.total || sum.ingest_count || 0);
     const pieEl = $("#visitor-upload-pie");
     const legendEl = $("#visitor-upload-legend");
     if (pieEl) renderUploadPie(pieEl, legendEl, uploadStats.items || [], uploadStats.total || 0);
@@ -7506,7 +7811,10 @@ async function loadStorage(force = false) {
   const cards = $("#storage-cards");
   const msg = $("#storage-msg");
   if (!cards) return;
-  cards.innerHTML = `<p class="muted">加载中…</p>`;
+  if (!cards.querySelector(".storage-card")) {
+    cards.innerHTML = `<p class="muted">正在读取占用…</p>`;
+  }
+  if (msg) msg.textContent = force ? "正在重新清点文件夹…" : "";
   const data = await api(`/api/storage${force ? "?force=1" : ""}`);
   const b = data.bytes || {};
   const d = data.disk || {};
@@ -7526,18 +7834,67 @@ async function loadStorage(force = false) {
     <div class="storage-card"><div class="storage-label">离线地图包</div><div class="storage-value">${formatBytes(b.map_pack)}</div></div>
     <div class="storage-card"><div class="storage-label">data 合计</div><div class="storage-value">${formatBytes(b.data)}</div></div>
   `;
-  if (msg) {
-    const hc = data.content_hash || {};
-    const bits = [];
-    if (hc.total) {
-      bits.push(`内容指纹 ${hc.hashed || 0}/${hc.total}` + (hc.missing ? `（缺 ${hc.missing}）` : "（齐全）"));
-    }
-    if (data.cached) bits.push("占用已缓存");
-    msg.textContent = bits.join(" · ");
-  }
+  if (msg) msg.textContent = "";
   const dedup = $("#dedup-root");
   if (dedup && !dedup.dataset.loaded) {
-    dedup.innerHTML = `<p class="muted">点「检查重复项」：按去掉元数据后的内容指纹比对（同画面、不同 EXIF 也算重复）。升级后首次会重算库内指纹。</p>`;
+    dedup.innerHTML = `<p class="muted">点「检查重复项」后，在这里列出相同内容。</p>`;
+  }
+  updateDedupProgress({
+    hashed: (data.content_hash || {}).hashed || 0,
+    total: (data.content_hash || {}).total || 0,
+    missing: (data.content_hash || {}).missing || 0,
+    scan: { running: false },
+  });
+  api("/api/dedup?limit=1")
+    .then((dedup) => {
+      if ($("#manage-storage")?.classList.contains("hidden")) return;
+      updateDedupProgress(dedup);
+    })
+    .catch(() => {});
+}
+
+async function waitDedupReady(root, msg) {
+  let data = await api("/api/dedup?limit=500");
+  const scan = data.scan || {};
+  const needs = (data.missing || 0) > 0 || data.needs_rehash || scan.running;
+  if (!needs) return data;
+  if (!scan.running) {
+    const q = data.needs_rehash ? "?force=true" : "";
+    await api(`/api/dedup/scan${q}`, { method: "POST", body: "{}" });
+  }
+  for (let i = 0; i < 7200; i++) {
+    const st = await api("/api/dedup/scan");
+    const hashed = st.hashed ?? 0;
+    const total = st.total ?? hashed;
+    const line = st.running
+      ? `内容指纹 ${hashed} / ${total}，还在补算`
+      : st.error || "指纹已更新";
+    if (msg) msg.textContent = line;
+    updateDedupProgress({ hashed, total, missing: st.missing || 0, scan: st });
+    if (!st.running) break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return api("/api/dedup?limit=500");
+}
+
+function updateDedupProgress(data) {
+  const hashed = Number(data.hashed || 0);
+  const total = Number(data.total || 0);
+  const running = Boolean(data.scan && data.scan.running) || Number(data.missing || 0) > 0;
+  const status = $("#dedup-status");
+  const bar = $("#dedup-bar");
+  const fill = $("#dedup-bar-fill");
+  const pct = total > 0 ? Math.min(100, Math.round((hashed * 100) / total)) : 0;
+  if (status) {
+    status.textContent = total
+      ? running
+        ? `内容指纹 ${hashed} / ${total}，还在补算`
+        : `内容指纹 ${hashed} / ${total}`
+      : "尚未检查";
+  }
+  if (bar && fill) {
+    bar.hidden = !total;
+    fill.style.width = `${pct}%`;
   }
 }
 
@@ -7545,27 +7902,37 @@ async function checkAndLoadDedup() {
   const root = $("#dedup-root");
   const msg = $("#storage-msg");
   if (!root) return;
-  root.innerHTML = `<p class="muted">正在从数据库比对内容指纹（已忽略元数据）…</p>`;
-  if (msg) msg.textContent = "查库中…";
+  root.innerHTML = `<p class="muted">正在读取已入库的指纹…</p>`;
+  if (msg) msg.textContent = "";
   try {
-    let data = await api("/api/dedup?limit=100");
-    const missing = Number(data.missing || 0);
-    const needsRehash = !!data.needs_rehash;
-    if (missing > 0 || needsRehash) {
-      const hint = needsRehash
-        ? "正在按去元数据内容重算全部指纹，大库可能较久…"
-        : `有 ${missing} 条缺指纹，正在补算…`;
-      if (msg) msg.textContent = hint;
-      root.innerHTML = `<p class="muted">${hint}</p>`;
-      const scan = await api("/api/dedup/scan", { method: "POST", body: "{}" });
-      if (msg) msg.textContent = scan.message || "指纹已更新";
-      data = await api("/api/dedup?limit=100");
-    } else {
-      const hashed = data.hashed ?? data.total ?? 0;
-      const total = data.total ?? hashed;
-      if (msg) msg.textContent = `已用去元数据内容指纹比对（${hashed}/${total}）`;
+    let data = await api("/api/dedup?limit=500");
+    if ((data.missing || 0) > 0 || data.needs_rehash) {
+      if (!(data.scan && data.scan.running)) {
+        const q = data.needs_rehash && !(data.hashed > 0) ? "?force=true" : "";
+        await api(`/api/dedup/scan${q}`, { method: "POST", body: "{}" });
+        data = await api("/api/dedup?limit=500");
+      }
     }
+    updateDedupProgress(data);
+    const groupKey = (payload) =>
+      (payload.groups || []).map((g) => `${g.content_hash}:${g.count}`).join("|");
     renderDedupList(data);
+    let shown = groupKey(data);
+    if ((data.scan && data.scan.running) || (data.missing || 0) > 0) {
+      for (let i = 0; i < 7200; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        if (!root.isConnected) return;
+        data = await api("/api/dedup?limit=500");
+        updateDedupProgress(data);
+        const next = groupKey(data);
+        const still = Boolean(data.scan && data.scan.running) || (data.missing || 0) > 0;
+        if (next !== shown || !still) {
+          shown = next;
+          renderDedupList(data);
+        }
+        if (!still) break;
+      }
+    }
   } catch (e) {
     if (msg) msg.textContent = e.message || String(e);
     root.innerHTML = `<p class="empty">${escapeHtml(e.message || String(e))}</p>`;
@@ -7578,13 +7945,14 @@ function renderDedupList(data) {
   root.dataset.loaded = "1";
   const groups = data.groups || [];
   if (!groups.length) {
-    const hashed = data.hashed ?? "—";
-    const total = data.total ?? "—";
-    root.innerHTML = `<p class="empty">未发现内容重复（指纹 ${hashed}/${total}）。入库时相同文件会自动跳过。</p>`;
+    root.innerHTML = `<p class="empty">已检查的照片里，没有压缩内容相同的重复项。</p>`;
     return;
   }
+  const more = data.truncated
+    ? `<p class="muted">只列出前 ${groups.length} 组，后面可能还有。</p>`
+    : "";
   root.innerHTML =
-    `<div class="search-head"><strong>发现 ${groups.length} 组重复</strong><span class="muted">勾选要保留的一份，其余移入回收站 · 指纹 ${data.hashed ?? "—"}/${data.total ?? "—"}</span></div>` +
+    `<div class="search-head"><strong>发现 ${groups.length} 组重复</strong><span class="muted">每组勾选要保留的一份，其余移入回收站</span></div>${more}` +
     groups
       .map((g, gi) => {
         const items = g.items || [];
@@ -7614,7 +7982,7 @@ async function loadDedupList() {
   const root = $("#dedup-root");
   if (!root) return;
   root.innerHTML = `<p class="muted">加载重复项…</p>`;
-  const data = await api("/api/dedup?limit=100");
+  const data = await api("/api/dedup?limit=500");
   renderDedupList(data);
 }
 
@@ -7665,10 +8033,7 @@ async function resolveAllDedup(strategy) {
   const msg = $("#storage-msg");
   if (msg) msg.textContent = "处理中…";
   try {
-    const preview = await api("/api/dedup?limit=1");
-    if (Number(preview.missing || 0) > 0) {
-      await api("/api/dedup/scan", { method: "POST", body: "{}" });
-    }
+    await waitDedupReady($("#dedup-root"), msg);
     const r = await api("/api/dedup/resolve-all", {
       method: "POST",
       body: JSON.stringify({ strategy }),
@@ -7761,6 +8126,7 @@ lbViewport?.addEventListener("pointerdown", (e) => {
 
 /* Boot */
 setupImportMobileUX();
+bindMacPhotoPicker();
 wireUploadQueueControls();
 wireUploadHist();
 wireMediaKindFilter();
@@ -7785,20 +8151,14 @@ async function bootAuthAndUi() {
     }
   }
   // 并行拉身份与品牌，缩短首屏等待
-  const meP = api("/api/me").catch(() => ({
-    open_mode: true,
-    can_edit: true,
-    can_upload: true,
-    can_settings: true,
-    can_trash: true,
-  }));
+  const meP = api("/api/me").catch(() => null);
   const cfgP = api("/api/config").catch(() => null);
   const me = await meP;
-  applyCapabilities(me);
-  if (!me?.authenticated) {
+  if (!me || me.needs_setup || !me.authenticated) {
     location.replace("/login");
     return;
   }
+  applyCapabilities(me);
   const cfg = await cfgP;
   if (cfg) applyBrand(cfg);
   // 每次进入固定时光浏览（不恢复上次管理/地图页，减轻首屏卡顿感）

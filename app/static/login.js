@@ -132,7 +132,7 @@ async function boot() {
   const submit = $("#login-submit");
   if (needsSetup) {
     if (heading) heading.textContent = "创建超级用户";
-    if (hint) hint.textContent = "首次使用：设置用户名与密码，之后用此账号管理相册。";
+    if (hint) hint.textContent = "还没有超级用户。请先创建，创建完成前相册不对外开放，避免权限旁落。";
     if (submit) submit.textContent = "创建并登录";
     const pass = $("#login-pass");
     if (pass) {

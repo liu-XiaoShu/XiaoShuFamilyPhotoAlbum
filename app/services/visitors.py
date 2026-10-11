@@ -19,6 +19,7 @@ _SKIP_PREFIXES = (
     "/api/health",
     "/api/visitors",
     "/api/thumb",  # 缩略图请求极多，不计入访问以免拖慢树莓派
+    "/api/preview",
     "/favicon",
     "/styles.css",
     "/app.js",
@@ -29,6 +30,24 @@ _SKIP_PREFIXES = (
     "/map-tiles/",
 )
 _lock = threading.Lock()
+_READ_CACHE: dict[tuple, tuple[float, Any]] = {}
+_READ_TTL = 45.0
+
+
+def _ttl(fn):
+    """访问数据页的聚合查询缓存一小会儿，避免每次打开都全表扫描。"""
+
+    def wrapped(*args, **kwargs):
+        key = (fn.__name__, args, tuple(sorted(kwargs.items())))
+        now = time.time()
+        hit = _READ_CACHE.get(key)
+        if hit and now - hit[0] < _READ_TTL:
+            return hit[1]
+        val = fn(*args, **kwargs)
+        _READ_CACHE[key] = (now, val)
+        return val
+
+    return wrapped
 
 
 def _now() -> datetime:
@@ -44,6 +63,8 @@ def connect() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(DB_PATH), timeout=30)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     try:
         yield con
         con.commit()
@@ -159,7 +180,7 @@ def detect_source(path: str, query: str, referer: str, headers: dict) -> tuple[s
 
 
 def extract_media_path(path: str, query: str) -> str:
-    if path.startswith(("/api/thumb", "/api/media", "/api/file", "/api/preview", "/api/photo")):
+    if path.startswith(("/api/thumb", "/api/media", "/api/file", "/api/play", "/api/preview", "/api/photo")):
         qs = parse_qs(query or "")
         p = (qs.get("path") or [""])[0].strip()
         return p[:500]
@@ -238,6 +259,7 @@ def record_visit(
             )
 
 
+@_ttl
 def list_history(limit: int = 200, offset: int = 0) -> list[dict]:
     with connect() as con:
         rows = con.execute(
@@ -250,6 +272,7 @@ def list_history(limit: int = 200, offset: int = 0) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+@_ttl
 def list_current(window_sec: int = _ACTIVE_WINDOW_SEC) -> list[dict]:
     since = _iso(_now() - timedelta(seconds=window_sec))
     with connect() as con:
@@ -270,6 +293,7 @@ def list_current(window_sec: int = _ACTIVE_WINDOW_SEC) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+@_ttl
 def visit_curve(days: int = 14) -> list[dict]:
     """近 N 天每日访问量；无数据的日期补 0，便于前端画满整段曲线。"""
     days = max(1, min(int(days), 90))
@@ -303,6 +327,7 @@ def visit_curve(days: int = 14) -> list[dict]:
     return out
 
 
+@_ttl
 def hot_media(limit: int = 30) -> list[dict]:
     with connect() as con:
         rows = con.execute(
@@ -320,6 +345,7 @@ def hot_media(limit: int = 30) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+@_ttl
 def list_blacklist() -> list[dict]:
     with connect() as con:
         rows = con.execute(
@@ -339,6 +365,7 @@ def add_blacklist(kind: str, value: str, reason: str = "") -> dict:
         raise ValueError("IP 格式无效")
     if kind == "mac" and not re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", value):
         raise ValueError("MAC 格式无效，例 aa:bb:cc:dd:ee:ff")
+    _READ_CACHE.clear()
     with connect() as con:
         con.execute(
             """
@@ -356,19 +383,28 @@ def add_blacklist(kind: str, value: str, reason: str = "") -> dict:
 
 
 def remove_blacklist(item_id: int) -> bool:
+    _READ_CACHE.clear()
     with connect() as con:
         cur = con.execute("DELETE FROM blacklist WHERE id=?", (int(item_id),))
         return cur.rowcount > 0
 
 
+@_ttl
 def summary() -> dict:
     with connect() as con:
-        total = con.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
-        ips = con.execute("SELECT COUNT(DISTINCT ip) FROM visits").fetchone()[0]
         today = _iso(_now())[:10]
-        today_n = con.execute(
-            "SELECT COUNT(*) FROM visits WHERE substr(ts,1,10)=?", (today,)
-        ).fetchone()[0]
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(DISTINCT ip) AS ips,
+                   SUM(CASE WHEN substr(ts, 1, 10) = ? THEN 1 ELSE 0 END) AS today_n
+            FROM visits
+            """,
+            (today,),
+        ).fetchone()
+        total = int(row["total"] or 0)
+        ips = int(row["ips"] or 0)
+        today_n = int(row["today_n"] or 0)
         bl = con.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
         ingest_n = 0
         try:
@@ -437,6 +473,7 @@ def record_ingest(
         )
 
 
+@_ttl
 def ingest_share_stats() -> dict:
     """各用户入库数量与占比（读库聚合，适合树莓派）。"""
     with connect() as con:
@@ -469,6 +506,7 @@ def ingest_share_stats() -> dict:
     return {"total": int(total or 0), "items": items}
 
 
+@_ttl
 def list_ingests(*, limit: int = 100, offset: int = 0, share_id: int | None = None) -> dict:
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))

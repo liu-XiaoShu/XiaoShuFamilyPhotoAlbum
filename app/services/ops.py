@@ -14,6 +14,36 @@ _HOST_UID: int | None = None
 _HOST_GID: int | None = None
 _HOST_READY = False
 
+
+def _host_ids() -> tuple[int | None, int | None]:
+    global _HOST_UID, _HOST_GID, _HOST_READY
+    if _HOST_READY:
+        return _HOST_UID, _HOST_GID
+    try:
+        uid = os.environ.get("HOST_UID") or os.environ.get("ALBUM_HOST_UID")
+        gid = os.environ.get("HOST_GID") or os.environ.get("ALBUM_HOST_GID")
+        _HOST_UID = int(uid) if uid not in (None, "") else None
+        _HOST_GID = int(gid) if gid not in (None, "") else None
+    except ValueError:
+        _HOST_UID, _HOST_GID = None, None
+    _HOST_READY = True
+    return _HOST_UID, _HOST_GID
+
+
+def ensure_host_perms(path: Path, *, is_dir: bool = False) -> None:
+    """chmod 保证可读；若配置 HOST_UID 且进程为 root 则 chown 到宿主机用户。"""
+    try:
+        if not path.exists():
+            return
+        mode = 0o755 if (is_dir or path.is_dir()) else 0o644
+        os.chmod(path, mode)
+        uid, gid = _host_ids()
+        if uid is not None and os.geteuid() == 0:
+            os.chown(path, uid, gid if gid is not None else uid)
+    except OSError:
+        pass
+
+
 # 旁路目录体积缓存（相册原片已走索引，这两类扫盘最慢）
 _DIR_SIZE_CACHE: dict[str, tuple[float, int]] = {}
 _DIR_SIZE_TTL = 180.0  # 秒
@@ -218,21 +248,17 @@ def find_existing_by_hash(content_hash: str, *, exclude_rel: str | None = None) 
     h = (content_hash or "").strip().lower()
     if not h:
         return []
+    short = h[:8]
     found: list[str] = []
     try:
         from . import media_index
 
         found = media_index.paths_by_content_hash(h)
-        if found:
-            return [p for p in found if p != exclude_rel]
-        # 索引已有数据时不再全盘重算 MD5（树莓派极慢）；缺指纹靠 /api/dedup/scan 补
-        if media_index.index_count() > 0:
-            return []
     except Exception:
         found = []
+    if found:
+        return [p for p in found if p != exclude_rel]
 
-    # 仅索引为空时的兜底：按文件名短 hash 缩小候选后再比对
-    short = h[:8]
     root = config.album_root
     if not root.exists():
         return []

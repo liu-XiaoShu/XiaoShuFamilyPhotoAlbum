@@ -15,13 +15,12 @@ from ..config import ROOT
 
 DB_PATH = ROOT / "data" / "geo" / "places.sqlite"
 
-# level 权重：越大越优先（国家最粗，避免「泰国曼谷」只命中国家级）
+# level 权重：越大越优先
 _LEVEL_WEIGHT = {
     "district": 40,
     "county": 40,
     "city": 20,
     "province": 10,
-    "country": 5,
 }
 
 _lock = threading.Lock()
@@ -74,7 +73,6 @@ _LEVEL_LABEL = {
     "county": "区县",
     "city": "市级",
     "province": "省级",
-    "country": "国家",
 }
 
 

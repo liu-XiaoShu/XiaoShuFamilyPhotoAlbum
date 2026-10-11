@@ -2,13 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
-import threading
-import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -20,23 +15,16 @@ from .metadata import PhotoMeta, apply_meta_dict, read_meta, write_meta
 from .naming import (
     MEDIA_EXTS,
     build_rel_path,
-    guess_datetime_from_name,
+    file_md5,
     is_image,
     is_media,
     is_video,
     parse_datetime,
-    parse_title_from_filename,
     sanitize_title,
     unique_path,
 )
 
 TRASH_DIRNAME = ".trash"
-_HASH_CACHE_LOCK = threading.Lock()
-_HASH_CACHE_MEM: dict[str, dict] | None = None
-_PARSE_WORKERS = max(1, min(3, (os.cpu_count() or 2)))
-_IMPORT_LIST_LOCK = threading.Lock()
-_IMPORT_LIST_MEM: tuple[float, list] | None = None
-_IMPORT_LIST_TTL = 2.5
 
 
 
@@ -62,22 +50,13 @@ def thumb_dir() -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-def _index_upsert(
-    rel: str | None,
-    *,
-    uploaded_by_share_id: int | None = None,
-    content_hash: str | None = None,
-) -> None:
+def _index_upsert(rel: str | None, *, uploaded_by_share_id: int | None = None) -> None:
     if not rel:
         return
     try:
         from . import media_index
 
-        media_index.upsert_media(
-            rel,
-            uploaded_by_share_id=uploaded_by_share_id,
-            content_hash=content_hash,
-        )
+        media_index.upsert_media(rel, uploaded_by_share_id=uploaded_by_share_id)
     except Exception:
         pass
 
@@ -121,22 +100,6 @@ def album_path(rel: str | Path) -> Path:
     return _safe_under(config.album_root, Path(rel))
 
 
-def canonicalize_album_rel(album_rel: str) -> str:
-    """旁白伴生名 foo.jpg.narration.m4a → 主图 foo.jpg，避免灯箱把音频当图片。"""
-    rel = (album_rel or "").replace("\\", "/").lstrip("/")
-    name = Path(rel).name
-    marker = ".narration."
-    if marker not in name:
-        return rel
-    orig = name.split(marker, 1)[0]
-    parent = str(Path(rel).parent).replace("\\", "/")
-    if not orig:
-        return rel
-    if parent in ("", "."):
-        return orig
-    return f"{parent}/{orig}"
-
-
 def import_path(rel: str | Path) -> Path:
     return _safe_under(config.import_root, Path(rel))
 
@@ -165,18 +128,11 @@ def save_uploads(items: list[tuple[str, bytes]]) -> dict:
         ensure_host_perms(dest.parent, is_dir=True)
         ensure_host_perms(dest)
         saved.append(str(dest.relative_to(root)).replace("\\", "/"))
-    invalidate_import_list_cache()
     return {"ok": True, "saved": saved, "skipped": skipped, "count": len(saved)}
 
 
 def list_import_images(*, with_meta: bool = False) -> list[dict]:
     """列出待入库媒体。默认不读 EXIF（数百文件时很快）；点「解析」再 with_meta。"""
-    global _IMPORT_LIST_MEM
-    if not with_meta:
-        with _IMPORT_LIST_LOCK:
-            mem = _IMPORT_LIST_MEM
-            if mem and (time.monotonic() - mem[0]) < _IMPORT_LIST_TTL:
-                return deepcopy(mem[1])
     root = config.import_root
     if not root.exists():
         return []
@@ -195,15 +151,7 @@ def list_import_images(*, with_meta: bool = False) -> list[dict]:
     items = []
     for p in media_files:
         rel = str(p.relative_to(root)).replace("\\", "/")
-        if with_meta:
-            meta = read_meta(p)
-        else:
-            # 不读 EXIF 时也先用文件名上的时间/简述填待入库列表
-            guessed = guess_datetime_from_name(p.name) or guess_datetime_from_name(rel)
-            meta = PhotoMeta(
-                datetime=guessed.strftime("%Y-%m-%d %H:%M:%S") if guessed else None,
-                title=parse_title_from_filename(p.name),
-            )
+        meta = read_meta(p) if with_meta else PhotoMeta()
         kind = "video" if is_video(p) else "image"
         live_companion = bool(
             is_video(p)
@@ -218,261 +166,15 @@ def list_import_images(*, with_meta: bool = False) -> list[dict]:
                 "kind": kind,
                 "meta": meta.to_dict(),
                 "live_companion": live_companion,
-                "content_hash": None,
-                "duplicate": False,
-                "duplicate_of": [],
-                "inbox_duplicate": False,
-                "inbox_duplicate_of": [],
             }
         )
-    if not with_meta:
-        with _IMPORT_LIST_LOCK:
-            _IMPORT_LIST_MEM = (time.monotonic(), deepcopy(items))
     return items
 
 
-def invalidate_import_list_cache() -> None:
-    global _IMPORT_LIST_MEM
-    with _IMPORT_LIST_LOCK:
-        _IMPORT_LIST_MEM = None
+def parse_import_meta() -> list[dict]:
+    """Re-read source metadata for all import images (UI prefill)."""
+    return list_import_images(with_meta=True)
 
-
-def _hash_cache_path() -> Path:
-    return config.thumb_root.parent / "import_hash_cache.json"
-
-
-def _load_hash_cache() -> dict[str, dict]:
-    global _HASH_CACHE_MEM
-    with _HASH_CACHE_LOCK:
-        if _HASH_CACHE_MEM is not None:
-            return _HASH_CACHE_MEM
-        path = _hash_cache_path()
-        data: dict[str, dict] = {}
-        if path.is_file():
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    data = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
-            except (OSError, json.JSONDecodeError, TypeError):
-                data = {}
-        _HASH_CACHE_MEM = data
-        return data
-
-
-def _save_hash_cache(cache: dict[str, dict]) -> None:
-    global _HASH_CACHE_MEM
-    with _HASH_CACHE_LOCK:
-        _HASH_CACHE_MEM = cache
-        path = _hash_cache_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(path)
-        except OSError:
-            pass
-
-
-def _cached_content_hash(
-    rel: str, src: Path, cache: dict[str, dict], dirty: list[bool], *, compute: bool = True
-) -> str | None:
-    """按 path+size+mtime 复用 MD5；文件未变则跳过重算。"""
-    try:
-        st = src.stat()
-    except OSError:
-        return None
-    if st.st_size < 64:
-        return None
-    hit = cache.get(rel) or {}
-    from .naming import CONTENT_HASH_ALGO
-
-    if (
-        hit.get("algo") == CONTENT_HASH_ALGO
-        and hit.get("size") == st.st_size
-        and hit.get("mtime") == int(st.st_mtime)
-        and isinstance(hit.get("hash"), str)
-        and len(hit["hash"]) == 32
-    ):
-        return hit["hash"].lower()
-    if not compute:
-        return None
-    from .ops import content_hash_of
-
-    h = content_hash_of(src)
-    cache[rel] = {
-        "size": st.st_size,
-        "mtime": int(st.st_mtime),
-        "hash": h,
-        "algo": CONTENT_HASH_ALGO,
-    }
-    dirty[0] = True
-    return h
-
-
-def _fill_import_meta(items: list[dict]) -> None:
-    """并行读 EXIF（JPEG 快路径为主）；缺失文件跳过。"""
-    if not items:
-        return
-
-    def one(it: dict) -> None:
-        rel = it.get("path") or ""
-        try:
-            src = import_path(rel)
-            if not src.is_file():
-                return
-            it["meta"] = read_meta(src).to_dict()
-            it["size"] = src.stat().st_size
-        except Exception:
-            pass
-
-    workers = 1 if len(items) < 8 else _PARSE_WORKERS
-    if workers == 1:
-        for it in items:
-            one(it)
-        return
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(one, items))
-
-
-def _annotate_import_duplicates(items: list[dict]) -> list[dict]:
-    """解析阶段：计算 MD5，与相册库 / 待入库批次内比对并标记重复。"""
-    from .ops import find_existing_by_hash
-
-    album_map: dict[str, list[str]] = {}
-    try:
-        from . import media_index
-
-        album_map = media_index.content_hash_path_map()
-    except Exception:
-        album_map = {}
-
-    cache = _load_hash_cache()
-    dirty = [False]
-    cache_lock = threading.Lock()
-
-    def hash_one(it: dict) -> tuple[dict, str | None]:
-        rel = it.get("path") or ""
-        try:
-            src = import_path(rel)
-            if not src.is_file():
-                return it, None
-            if src.stat().st_size < 64:
-                return it, None
-            with cache_lock:
-                h = _cached_content_hash(rel, src, cache, dirty)
-            return it, h
-        except Exception:
-            return it, None
-
-    workers = 1 if len(items) < 6 else _PARSE_WORKERS
-    hashed: list[tuple[dict, str | None]] = []
-    if workers == 1:
-        hashed = [hash_one(it) for it in items]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            hashed = list(pool.map(hash_one, items))
-
-    if dirty[0]:
-        if len(cache) > 5000:
-            overflow = len(cache) - 4000
-            for k in list(cache.keys())[:overflow]:
-                cache.pop(k, None)
-        _save_hash_cache(cache)
-
-    by_hash: dict[str, list[int]] = {}
-    # 保持原 items 顺序索引
-    index_of = {id(it): i for i, it in enumerate(items)}
-    for it, h in hashed:
-        i = index_of.get(id(it))
-        if i is None:
-            continue
-        if not h:
-            it["content_hash"] = None
-            continue
-        it["content_hash"] = h
-        album_hits = album_map.get(h) or []
-        if not album_hits and not album_map:
-            # 索引为空时仍走旧兜底
-            try:
-                album_hits = find_existing_by_hash(h)
-            except Exception:
-                album_hits = []
-        it["duplicate_of"] = list(album_hits)
-        it["duplicate"] = bool(album_hits)
-
-        peers = by_hash.get(h) or []
-        it["inbox_duplicate"] = bool(peers)
-        it["inbox_duplicate_of"] = [items[j]["path"] for j in peers]
-        for j in peers:
-            items[j]["inbox_duplicate"] = True
-            items[j]["inbox_duplicate_of"] = [
-                items[k]["path"] for k in peers + [i] if k != j
-            ]
-        by_hash.setdefault(h, []).append(i)
-    return items
-
-
-def parse_import_meta(*, offset: int = 0, limit: int | None = None, paths: list[str] | None = None) -> dict:
-    """重读 EXIF，并与已入库指纹比对，标记重复项。
-
-    支持分片：offset/limit，便于前端显示进度、避免一次卡死。
-    paths 非空时只解析这些相对路径（上传结束后不必重扫整个待入库）。
-    """
-    all_items = list_import_images(with_meta=False)
-    want: set[str] | None = None
-    if paths:
-        want = {str(p).replace("\\", "/").strip().lstrip("/") for p in paths if p}
-        want.discard("")
-        work = [it for it in all_items if it.get("path") in want] if want else all_items
-    else:
-        work = all_items
-    total = len(work)
-    off = max(0, int(offset or 0))
-    if limit is None or int(limit) <= 0:
-        chunk = work[off:]
-        lim = len(chunk)
-    else:
-        lim = max(1, min(int(limit), 200))
-        chunk = work[off : off + lim]
-    _fill_import_meta(chunk)
-    _annotate_import_duplicates(chunk)
-    if want:
-        cache = _load_hash_cache()
-        dirty = [False]
-        peer_by_hash: dict[str, list[str]] = {}
-        for it in all_items:
-            rel = it.get("path") or ""
-            h = (it.get("content_hash") or "").lower()
-            if not h:
-                try:
-                    src = import_path(rel)
-                    if src.is_file():
-                        h = (_cached_content_hash(rel, src, cache, dirty, compute=False) or "").lower()
-                except Exception:
-                    h = ""
-            if h:
-                peer_by_hash.setdefault(h, []).append(rel)
-        for it in chunk:
-            h = (it.get("content_hash") or "").lower()
-            if not h:
-                continue
-            peers = [p for p in peer_by_hash.get(h, []) if p != it.get("path")]
-            if peers:
-                it["inbox_duplicate"] = True
-                it["inbox_duplicate_of"] = peers
-    done = off + len(chunk) >= total
-    album_dups = sum(1 for x in chunk if x.get("duplicate"))
-    inbox_dups = sum(1 for x in chunk if x.get("inbox_duplicate") and not x.get("duplicate"))
-    return {
-        "items": chunk,
-        "offset": off,
-        "limit": lim,
-        "total": total,
-        "processed": off + len(chunk),
-        "done": done,
-        "duplicate_album": album_dups,
-        "duplicate_inbox": inbox_dups,
-    }
 
 def ingest_one(
     source_rel: str,
@@ -502,13 +204,7 @@ def ingest_one(
         )
     else:
         meta = read_meta(src)
-    dt = (
-        parse_datetime(datetime_str)
-        or parse_datetime(meta.datetime)
-        or guess_datetime_from_name(src.name)
-        or guess_datetime_from_name(source_rel)
-        or datetime.now()
-    )
+    dt = parse_datetime(datetime_str) or parse_datetime(meta.datetime) or datetime.now()
     title_final = sanitize_title(title if title is not None else meta.title, config.title_max_len)
 
     meta.datetime = dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -564,45 +260,31 @@ def ingest_one(
             "message": "已更新元数据",
         }
 
-    # 同盘优先 rename（待入库与相册都在 1T 盘时几乎瞬时）；跨盘再 copy
+    # Copy then write meta then remove source (safer across devices)
+    shutil.copy2(src, dest)
     src_is_video = is_video(src)
     src_is_heic = src.suffix.lower() in {".heic", ".heif"}
-    src_parent = src.parent
-    moved = False
-    try:
-        os.replace(src, dest)
-        moved = True
-    except OSError:
-        shutil.copy2(src, dest)
     live_msg = ""
     live_dest = None
     try:
-        from .video import sidecar_path, write_sidecar
+        from .video import read_sidecar, sidecar_path, write_sidecar
 
         if src_is_video or src_is_heic:
-            src_side = sidecar_path(src_parent / src.name)
+            src_side = sidecar_path(src)
             if src_side.exists():
                 shutil.copy2(src_side, sidecar_path(dest))
-                if moved:
-                    try:
-                        src_side.unlink(missing_ok=True)
-                    except OSError:
-                        pass
 
         # Live Photo：同名 MOV 随 HEIC 无损旁路保存
         if src_is_heic and from_import:
             for ext in (".MOV", ".mov"):
-                companion = src_parent / (src.stem + ext)
+                companion = src.with_name(src.stem + ext)
                 if companion.exists() and companion.is_file():
                     live_dest = dest.with_name(dest.name + ".live.mov")
+                    shutil.copy2(companion, live_dest)
                     try:
-                        os.replace(companion, live_dest)
+                        companion.unlink(missing_ok=True)
                     except OSError:
-                        shutil.copy2(companion, live_dest)
-                        try:
-                            companion.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        pass
                     live_msg = "（含实况视频）"
                     break
 
@@ -614,15 +296,17 @@ def ingest_one(
                 {"kind": "heic", "live_video": live_dest.name},
             )
 
-        if not moved and src.resolve() != dest.resolve():
+        if src.resolve() != dest.resolve():
             if not from_import:
+                # 相册内重排：旁白/封面等旁路随主文件改名
                 move_companions(src, dest)
-            side_to_drop = sidecar_path(src) if (src_is_video or src_is_heic) else None
+            side_to_drop = None
+            if src_is_video or src_is_heic:
+                side_to_drop = sidecar_path(src)
             src.unlink(missing_ok=True)
             if side_to_drop and side_to_drop.exists():
                 side_to_drop.unlink(missing_ok=True)
-        stop_root = config.import_root if from_import else config.album_root
-        _cleanup_empty_parents(src if src.exists() else src_parent / ".keep", stop_root)
+            _cleanup_empty_parents(src, config.import_root if from_import else config.album_root)
     except Exception:
         if dest.exists() and src.exists():
             dest.unlink(missing_ok=True)
@@ -644,22 +328,13 @@ def ingest_one(
             old_rel = None
     if old_rel and old_rel != new_rel:
         _index_move(old_rel, new_rel)
-        try:
-            from . import media_index
-
-            media_index.set_content_hash(new_rel, content_hash)
-        except Exception:
-            pass
     else:
-        # 入库时同步写入完整 MD5，供查重直接读库
-        _index_upsert(
-            new_rel,
-            uploaded_by_share_id=uploaded_by_share_id,
-            content_hash=content_hash,
-        )
-
-    if from_import:
-        invalidate_import_list_cache()
+        _index_upsert(new_rel, uploaded_by_share_id=uploaded_by_share_id)
+    try:
+        from . import media_index
+        media_index.set_content_hash(new_rel, content_hash)
+    except Exception:
+        pass
 
     return {
         "ok": True,
@@ -763,7 +438,6 @@ def discard_import(*, paths: list[str] | None = None, all_items: bool = False) -
         except OSError:
             pass
 
-    invalidate_import_list_cache()
     return {"ok": True, "removed": len(removed), "paths": removed}
 
 def rearrange(
@@ -787,8 +461,9 @@ def rearrange(
 
 
 def update_meta_only(album_rel: str, fields: dict) -> dict:
+    path = album_path(album_rel)
+    meta = apply_meta_dict(path, fields)
     need_move = ("datetime" in fields) or ("title" in fields)
-    # 改时间/简述会重排目录：直接走 rearrange，避免先写一遍元数据再整文件搬迁
     if need_move:
         return rearrange(
             album_rel,
@@ -798,21 +473,7 @@ def update_meta_only(album_rel: str, fields: dict) -> dict:
             reflection=fields.get("reflection"),
             location=fields.get("location"),
         )
-    path = album_path(album_rel)
-    meta = apply_meta_dict(path, fields)
-    try:
-        from . import media_index
-
-        patch = {}
-        for key in ("datetime", "title", "description", "location"):
-            if key in fields:
-                patch[key] = getattr(meta, key, None)
-        if "location" in fields:
-            patch["lat"] = meta.lat
-            patch["lng"] = meta.lng
-        media_index.patch_media_meta(album_rel, patch)
-    except Exception:
-        _index_upsert(album_rel)
+    _index_upsert(album_rel)
     return {
         "ok": True,
         "path": album_rel,
@@ -824,69 +485,21 @@ def update_meta_only(album_rel: str, fields: dict) -> dict:
 
 def update_meta_batch(paths: list[str], fields: dict) -> dict:
     """批量更新已入库照片元数据；fields 仅包含需要改的键。"""
-    clean = dict(fields or {})
+    clean = {k: v for k, v in fields.items() if v is not None}
     if not clean:
         return {"ok": False, "results": [], "message": "没有可应用的字段"}
-    need_move = ("datetime" in clean) or ("title" in clean)
     results = []
     for rel in paths:
         try:
-            if need_move:
-                r = rearrange(
-                    rel,
-                    datetime_str=clean.get("datetime"),
-                    title=clean.get("title"),
-                    description=clean.get("description"),
-                    reflection=clean.get("reflection"),
-                    location=clean.get("location"),
-                )
-                results.append(
-                    {
-                        "ok": True,
-                        "path": r.get("path", rel),
-                        "message": r.get("message", ""),
-                        "renamed": bool(r.get("renamed")),
-                    }
-                )
-            else:
-                path = album_path(rel)
-                meta = apply_meta_dict(path, clean)
-                try:
-                    from . import media_index
-
-                    patch = {}
-                    for key in ("datetime", "title", "description", "location"):
-                        if key in clean:
-                            patch[key] = getattr(meta, key, None)
-                    if "location" in clean:
-                        patch["lat"] = meta.lat
-                        patch["lng"] = meta.lng
-                    media_index.patch_media_meta(rel, patch, invalidate=False)
-                except Exception:
-                    _index_upsert(rel)
-                results.append(
-                    {
-                        "ok": True,
-                        "path": rel,
-                        "message": "元数据已保存",
-                        "renamed": False,
-                    }
-                )
+            r = update_meta_only(rel, clean)
+            results.append({"ok": True, "path": r.get("path", rel), "message": r.get("message", "")})
         except Exception as e:
             results.append({"ok": False, "path": rel, "message": str(e)})
-    if not need_move:
-        try:
-            from . import media_index
-
-            media_index.invalidate_browse_caches()
-        except Exception:
-            pass
     ok_n = sum(1 for r in results if r["ok"])
     return {
         "ok": ok_n == len(results),
         "results": results,
         "message": f"成功 {ok_n}/{len(results)}",
-        "need_move": need_move,
     }
 
 
@@ -986,7 +599,6 @@ def timeline_month(
     scopes: list | None = None,
     media_paths: list | None = None,
     uploaded_by_share_id: int | None = None,
-    kind: str | None = None,
 ) -> dict:
     try:
         from . import media_index
@@ -1000,7 +612,6 @@ def timeline_month(
                 scopes=scopes,
                 media_paths=media_paths,
                 uploaded_by_share_id=uploaded_by_share_id,
-                kind=kind,
             )
     except Exception:
         pass
@@ -1019,11 +630,6 @@ def timeline_month(
                 ph.get("path") or "", scopes, media_paths, uploaded_by_share_id
             )
         ]
-    k = (kind or "").strip().lower()
-    if k == "video":
-        photos = [ph for ph in photos if (ph.get("kind") == "video")]
-    elif k == "image":
-        photos = [ph for ph in photos if (ph.get("kind") != "video")]
     total = len(photos)
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
@@ -1037,7 +643,6 @@ def timeline_month(
         "limit": limit,
         "has_more": offset + len(chunk) < total,
         "from_index": False,
-        "kind": kind or "all",
     }
 
 
@@ -1048,7 +653,6 @@ def timeline_paths(
     scopes: list | None = None,
     media_paths: list | None = None,
     uploaded_by_share_id: int | None = None,
-    kind: str | None = None,
 ) -> dict:
     try:
         from . import media_index
@@ -1061,13 +665,11 @@ def timeline_paths(
                 scopes=scopes,
                 media_paths=media_paths,
                 uploaded_by_share_id=uploaded_by_share_id,
-                kind=kind,
             )
     except Exception:
         pass
     data = _scan_timeline_fs()
     paths = []
-    k = (kind or "").strip().lower()
     for y in data.get("years") or []:
         if year and y.get("year") != year:
             continue
@@ -1079,12 +681,8 @@ def timeline_paths(
                 if scopes or media_paths or uploaded_by_share_id:
                     if not _path_visible(p, scopes, media_paths, uploaded_by_share_id):
                         continue
-                if k == "video" and ph.get("kind") != "video":
-                    continue
-                if k == "image" and ph.get("kind") == "video":
-                    continue
                 paths.append(p)
-    return {"paths": paths, "total": len(paths), "from_index": False, "kind": kind or "all"}
+    return {"paths": paths, "total": len(paths), "from_index": False}
 
 
 def map_summary(
@@ -1147,7 +745,6 @@ def map_clusters(
     media_paths: list | None = None,
     uploaded_by_share_id: int | None = None,
     limit: int = 800,
-    kind: str | None = None,
 ) -> dict:
     try:
         from . import media_index
@@ -1164,11 +761,10 @@ def map_clusters(
                 media_paths=media_paths,
                 uploaded_by_share_id=uploaded_by_share_id,
                 limit=limit,
-                kind=kind,
             )
     except Exception:
         pass
-    data = list_map_photos(kind=kind)
+    data = list_map_photos()
     points = data.get("points") or []
     if scopes or media_paths or uploaded_by_share_id:
         points = [
@@ -1314,13 +910,13 @@ def _scan_timeline_fs() -> dict:
     return {"years": result}
 
 
-def list_map_photos(kind: str | None = None) -> dict:
+def list_map_photos() -> dict:
     """返回带坐标的照片点位（GPS 优先，其次根据地点文本匹配）。"""
     try:
         from . import media_index
 
         media_index.ensure_index_ready()
-        indexed = media_index.map_points_from_index(kind=kind)
+        indexed = media_index.map_points_from_index()
         if indexed is not None:
             return indexed
     except Exception:
@@ -1383,8 +979,7 @@ def _list_map_photos_fs() -> dict:
 
     # 中国大致范围（含港澳台近海）；任一不在此范围则按世界视野
     def _in_china(lat: float, lng: float) -> bool:
-        # 南界约海南三亚；过低会把泰国中心点误判成「国内」
-        return 18.0 <= lat <= 54.5 and 73.0 <= lng <= 135.5
+        return 15.0 <= lat <= 54.5 and 72.0 <= lng <= 135.5
 
     has_foreign = any(not _in_china(p["lat"], p["lng"]) for p in points)
     return {
@@ -1398,46 +993,25 @@ def _list_map_photos_fs() -> dict:
 
 
 def get_photo(album_rel: str) -> dict:
-    album_rel = canonicalize_album_rel(album_rel)
     path = album_path(album_rel)
-    if not path.exists() or not is_media(path) or ".narration." in path.name:
+    if not path.exists():
         raise FileNotFoundError(album_rel)
-
-    # 优先读索引：减少灯箱翻页时的 EXIF/ffprobe
-    indexed = None
-    try:
-        from . import media_index
-
-        indexed = media_index.lookup_media(album_rel)
-    except Exception:
-        indexed = None
-
-    st = path.stat()
+    meta = read_meta(path)
     kind = "video" if is_video(path) else "image"
-    if indexed and indexed.get("kind"):
-        kind = indexed["kind"] or kind
-
-    if indexed and indexed.get("meta"):
-        meta_dict = dict(indexed["meta"])
-    else:
-        meta_dict = read_meta(path).to_dict()
-
     out = {
         "path": album_rel,
         "name": path.name,
-        "size": st.st_size,
+        "size": path.stat().st_size,
         "kind": kind,
-        "meta": meta_dict,
+        "meta": meta.to_dict(),
         "has_live": False,
         "live_video_path": None,
     }
     if kind == "video":
         from .video import cover_path, probe_duration, read_sidecar
 
-        dur = indexed.get("duration") if indexed else None
         side = read_sidecar(path)
-        if dur is None:
-            dur = side.get("duration")
+        dur = side.get("duration")
         if dur is None:
             dur = probe_duration(path)
         out["duration"] = dur
@@ -1451,10 +1025,7 @@ def get_photo(album_rel: str) -> dict:
             narr_rel = str(narr.relative_to(config.album_root)).replace("\\", "/")
             out["has_audio"] = True
             out["audio_path"] = narr_rel
-            aud = indexed.get("audio_duration") if indexed else None
-            if aud is None:
-                aud = probe_duration(narr)
-            out["audio_duration"] = aud
+            out["audio_duration"] = probe_duration(narr)
         else:
             out["has_audio"] = False
             out["audio_path"] = None
@@ -1594,74 +1165,6 @@ def import_preview_path(import_rel: str, size: int) -> Path:
     return d / f"{key}.jpg"
 
 
-def playable_path(source: str, rel: str, mtime: float, size: int) -> Path:
-    from .video import playable_cache_key
-
-    key = playable_cache_key(source, rel, mtime, size)
-    d = thumb_dir() / "play-cache"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / f"{key}.mp4"
-
-
-def ensure_playable(
-    rel: str,
-    source: str = "album",
-    max_height: int = 1080,
-    *,
-    client_hevc: bool = False,
-    client_h264: bool = False,
-) -> Path:
-    """返回浏览器可直接播放的文件路径（原件或转码缓存）。
-
-    策略：能秒开就秒开（含 H.264 MOV），后台再预热 mp4 缓存；
-    仅 HEVC 等必须转码的才阻塞等待。
-    若客户端声明能播 HEVC（如 Safari），则直接返回原件，避免树莓派转码。
-    """
-    from .video import (
-        ensure_browser_mp4,
-        is_browser_native,
-        is_stream_copy_ok,
-        schedule_warm_playable,
-        stream_codecs,
-        video_readable,
-    )
-
-    if source == "import":
-        src = import_path(rel)
-    else:
-        src = album_path(rel)
-    if not src.exists() or not is_video(src):
-        raise FileNotFoundError(rel)
-
-    ok, reason = video_readable(src)
-    if not ok:
-        raise ValueError(f"视频无法播放：{reason}")
-
-    st = src.stat()
-    out = playable_path(source, rel, st.st_mtime, st.st_size)
-    if out.exists() and out.stat().st_mtime >= st.st_mtime and out.stat().st_size > 1024:
-        return out
-
-    info = stream_codecs(src)
-    v = (info.get("vcodec") or "").lower()
-    # 客户端能解 HEVC：直接出原件，省掉 Pi 转码
-    if client_hevc and v in {"hevc", "h265", "hev1", "hvc1"}:
-        return src
-
-    # 浏览器可直出：立刻返回原件，后台慢慢做 mp4 缓存
-    if is_browser_native(src) or is_stream_copy_ok(src):
-        if src.suffix.lower() != ".mp4":
-            schedule_warm_playable(src, out, max_height=max_height)
-        return src
-
-    # 客户端声明 H.264 且源已是 H.264 容器怪异时仍优先原件
-    if client_h264 and v in {"h264", "avc1", "avc"}:
-        return src
-
-    # 必须转码（如 HEVC on Chromium）：阻塞生成一次，之后走缓存
-    return ensure_browser_mp4(src, out, max_height=max_height)
-
-
 def ensure_import_preview(import_rel: str, size: int = 160) -> Path:
     """待入库区列表预览：落盘缓存；视频抽帧封面，图片缩略。"""
     size = normalize_thumb_size(size)
@@ -1755,8 +1258,7 @@ def narration_files(media: Path) -> list[Path]:
     return sorted(
         p
         for p in media.parent.glob(media.name + ".narration.*")
-        if p.is_file()
-        and p.suffix.lower() in {".webm", ".m4a", ".mp3", ".ogg", ".wav", ".aac", ".mp4"}
+        if p.is_file() and p.suffix.lower() in {".webm", ".m4a", ".mp3", ".ogg", ".wav", ".aac"}
     )
 
 
@@ -1770,129 +1272,28 @@ def narration_dest(media: Path, ext: str = ".webm") -> Path:
     return media.with_name(media.name + ".narration" + ext.lower())
 
 
-def _sniff_audio_ext(data: bytes, filename: str | None) -> str:
-    allowed = {".webm", ".m4a", ".mp3", ".ogg", ".wav", ".aac", ".mp4"}
-    name = Path(filename or "").name
-    ext = Path(name).suffix.lower()
-    if len(data) >= 8 and data[4:8] == b"ftyp":
-        return ".m4a"
-    if data.startswith(b"\x1aE\xdf\xa3"):
-        return ".webm"
-    if data.startswith(b"OggS"):
-        return ".ogg"
-    if data.startswith(b"ID3") or data[:2] == b"\xff\xfb":
-        return ".mp3"
-    if data.startswith(b"RIFF"):
-        return ".wav"
-    if ext == ".mp4":
-        return ".m4a"
-    if ext in allowed:
-        return ext
-    return ".m4a"
-
-
-def _transcode_narration_m4a(data: bytes, src_ext: str) -> bytes | None:
-    """转成 AAC/M4A，电脑 Chrome 与手机 Safari 都能播。"""
-    import os
-    import tempfile
-
-    from .video import FFMPEG, _run
-
-    suf = src_ext if str(src_ext).startswith(".") else f".{src_ext or 'bin'}"
-    fd, inp = tempfile.mkstemp(suffix=suf)
-    os.close(fd)
-    outp = inp + ".m4a"
-    try:
-        Path(inp).write_bytes(data)
-        r = _run(
-            [
-                FFMPEG,
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-i",
-                inp,
-                "-vn",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "96k",
-                "-ar",
-                "44100",
-                "-ac",
-                "1",
-                "-movflags",
-                "+faststart",
-                "-f",
-                "mp4",
-                outp,
-            ],
-            timeout=90,
-        )
-        dest = Path(outp)
-        if r.returncode == 0 and dest.is_file() and dest.stat().st_size > 64:
-            return dest.read_bytes()
-        return None
-    except Exception:
-        return None
-    finally:
-        for p in (inp, outp):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-
-def ensure_narration_m4a(media: Path) -> Path | None:
-    """旧 webm 旁白转成 m4a，避免 Safari/幻灯片解不了 Opus。"""
-    narr = narration_file(media)
-    if not narr or not narr.is_file():
-        return None
-    if narr.suffix.lower() == ".m4a":
-        return narr
-    converted = _transcode_narration_m4a(narr.read_bytes(), narr.suffix)
-    if not converted:
-        return narr
-    dest = narration_dest(media, ".m4a")
-    dest.write_bytes(converted)
-    if dest.resolve() != narr.resolve():
-        try:
-            narr.unlink()
-        except OSError:
-            pass
-    return dest
-
-
 def save_narration(album_rel: str, data: bytes, *, filename: str | None = None) -> dict:
     src = album_path(album_rel)
     if not src.exists() or not is_media(src):
         raise FileNotFoundError(album_rel)
     if is_video(src):
         raise ValueError("视频请使用自身音轨；旁白仅支持图片")
+    # 清掉旧旁白
     for old in narration_files(src):
         try:
             old.unlink()
         except OSError:
             pass
-    ext = _sniff_audio_ext(data, filename)
-    converted = _transcode_narration_m4a(data, ext)
-    if converted:
-        data = converted
-        ext = ".m4a"
+    ext = Path(filename or "audio.webm").suffix.lower() or ".webm"
+    if ext not in {".webm", ".m4a", ".mp3", ".ogg", ".wav", ".aac"}:
+        ext = ".webm"
     dest = narration_dest(src, ext)
     dest.write_bytes(data)
-    dur = None
-    try:
-        from .video import probe_duration
+    from .video import probe_duration
 
-        dur = probe_duration(dest)
-    except Exception:
-        dur = None
+    dur = probe_duration(dest)
     narr_rel = str(dest.relative_to(config.album_root)).replace("\\", "/")
-    try:
-        _index_upsert(album_rel)
-    except Exception:
-        pass
+    _index_upsert(album_rel)
     return {
         "ok": True,
         "path": album_rel,
