@@ -51,6 +51,8 @@ const state = {
   selectedPaths: new Set(),
   batchTarget: null,
   importItemCount: 0,
+  /** @type {Map<string, {ok:boolean, message:string}>} 入库结果，刷新列表后仍保留失败标记 */
+  importOutcomes: new Map(),
   _detachedImportList: null,
   _importListParent: null,
   map: null,
@@ -2075,7 +2077,20 @@ function buildImportRow(it) {
         ? `<span class="live-badge">视频</span>`
         : "";
   const dupBlock = renderDupBlock(it);
-  const badges = kindBadge || dupBlock ? `<div class="import-badges">${kindBadge}${dupBlock}</div>` : "";
+  const outcome = state.importOutcomes?.get(it.path);
+  const failBadge =
+    outcome && outcome.ok === false
+      ? `<span class="import-fail-badge">入库失败</span>`
+      : "";
+  const failMsg =
+    outcome && outcome.ok === false && outcome.message
+      ? `<p class="import-fail-msg">${escapeHtml(outcome.message)}</p>`
+      : "";
+  if (outcome && outcome.ok === false) row.classList.add("is-ingest-fail");
+  const badges =
+    kindBadge || dupBlock || failBadge
+      ? `<div class="import-badges">${kindBadge}${dupBlock}${failBadge}</div>`
+      : "";
   const liveDis = it.live_companion ? "disabled" : "";
   row.innerHTML = `
     <label class="import-pick" title="选中入库">
@@ -2085,6 +2100,7 @@ function buildImportRow(it) {
     <div class="import-fields">
       <div class="import-file-name" title="${escapeAttr(it.name)}">${escapeAttr(it.name)}</div>
       ${badges}
+      ${failMsg}
       <label>时间 <input type="datetime-local" class="f-datetime" value="${escapeAttr(row.dataset.datetime)}" ${liveDis} /></label>
       <label>简述 <input type="text" class="f-title" maxlength="30" value="${escapeAttr(row.dataset.title)}" ${liveDis} /></label>
     </div>`;
@@ -2141,10 +2157,22 @@ function renderImportItems(items) {
   const empty = $("#import-empty");
   importPreviewLoader.reset();
   if (!list) return;
+  // 已不在待入库的路径，清掉旧结果，避免 Map 无限涨
+  const alive = new Set((items || []).map((it) => it.path));
+  if (state.importOutcomes?.size) {
+    for (const path of [...state.importOutcomes.keys()]) {
+      if (!alive.has(path)) state.importOutcomes.delete(path);
+    }
+  }
   list.innerHTML = "";
   state.importItemCount = items.length;
   const countEl = $("#import-count");
-  if (countEl) countEl.textContent = items.length ? `共 ${items.length} 项` : "";
+  const failN = [...(state.importOutcomes?.values() || [])].filter((x) => x && x.ok === false).length;
+  if (countEl) {
+    countEl.textContent = items.length
+      ? `共 ${items.length} 项${failN ? ` · 失败 ${failN}` : ""}`
+      : "";
+  }
   if (!items.length) {
     empty?.classList.remove("hidden");
     return;
@@ -2210,11 +2238,38 @@ const ingestState = {
   cancel: false,
   startedAt: 0,
 };
+const parseState = { running: false };
+const importListState = { loading: false };
 
-function setIngestProgress({ show, title, summary, detail, percent }) {
+function setDropStatus(text, kind = "") {
+  const el = $("#drop-status");
+  if (el) {
+    el.textContent = text || "";
+    el.classList.remove("is-busy", "is-ok", "is-warn", "is-error");
+    if (kind) el.classList.add(`is-${kind}`);
+  }
+  const bar = $("#import-status");
+  if (!bar) return;
+  const msg = (text || "").trim();
+  if (!msg) {
+    bar.hidden = true;
+    bar.textContent = "";
+    bar.classList.remove("is-busy", "is-ok", "is-warn", "is-error");
+    return;
+  }
+  bar.hidden = false;
+  bar.textContent = msg;
+  bar.classList.remove("is-busy", "is-ok", "is-warn", "is-error");
+  if (kind) bar.classList.add(`is-${kind}`);
+}
+
+function setIngestProgress({ show, title, summary, detail, percent, tone }) {
   const box = $("#ingest-progress");
   const bar = $("#ingest-progress-bar");
   if (!box) return;
+  box.classList.remove("is-done-ok", "is-done-fail");
+  if (tone === "ok") box.classList.add("is-done-ok");
+  if (tone === "fail") box.classList.add("is-done-fail");
   box.classList.toggle("hidden", !show);
   if (title != null && $("#ingest-progress-title")) $("#ingest-progress-title").textContent = title;
   if (summary != null && $("#ingest-progress-summary")) $("#ingest-progress-summary").textContent = summary;
@@ -2254,19 +2309,45 @@ function resetImportUiState() {
   }
 }
 
-async function loadImport() {
+async function loadImport({ quiet = false } = {}) {
   ensureImportListEl();
   const empty = $("#import-empty");
   const list = ensureImportListEl();
+  const btn = $("#btn-reload-import");
+  if (importListState.loading) {
+    if (!quiet) setDropStatus("正在刷新待入库列表…", "busy");
+    return;
+  }
+  importListState.loading = true;
+  if (btn) btn.disabled = true;
+  if (!quiet) setDropStatus("正在刷新待入库列表…", "busy");
   if (list && !list.children.length) {
     if (empty) {
       empty.classList.remove("hidden");
       empty.textContent = "正在读取待入库列表…";
     }
   }
-  const data = await api("/api/import/list");
-  if (empty) empty.textContent = "暂无待入库媒体，先拖入或选择文件。";
-  renderImportItems(data.items || []);
+  try {
+    const data = await api("/api/import/list");
+    if (empty) empty.textContent = "暂无待入库媒体，先拖入或选择文件。";
+    const items = data.items || [];
+    renderImportItems(items);
+    const failN = [...(state.importOutcomes?.values() || [])].filter((x) => x && x.ok === false).length;
+    if (!quiet) {
+      setDropStatus(
+        items.length
+          ? `列表已刷新：共 ${items.length} 项${failN ? `，其中入库失败 ${failN} 项仍保留` : ""}`
+          : "列表已刷新：暂无待入库媒体",
+        failN ? "warn" : "ok"
+      );
+    }
+  } catch (err) {
+    if (!quiet) setDropStatus(err?.message || String(err), "error");
+    throw err;
+  } finally {
+    importListState.loading = false;
+    if (btn) btn.disabled = false;
+  }
 }
 
 function selectSameDayImport() {
@@ -2299,11 +2380,22 @@ async function parseImportList(opts = {}) {
   const onlyPaths = Array.isArray(opts.paths)
     ? [...new Set(opts.paths.filter(Boolean))]
     : null;
+  if (parseState.running) {
+    setDropStatus("正在解析中，请稍候…", "busy");
+    return;
+  }
+  parseState.running = true;
+  const btnParse = $("#btn-parse");
+  if (btnParse) btnParse.disabled = true;
   try {
-    if ($("#drop-status")) $("#drop-status").textContent = "正在解析元数据并比对相册指纹… 0%";
+    setDropStatus("正在解析元数据并比对相册指纹… 0%", "busy");
     // 先拿轻量列表，解析过程中逐步回填，避免长时间无反馈
     const base = await api("/api/import/list").catch(() => ({ items: [] }));
     let merged = Array.isArray(base.items) ? base.items.slice() : [];
+    if (onlyPaths) {
+      const want = new Set(onlyPaths);
+      merged = merged.filter((it) => want.has(it.path));
+    }
     const byPath = new Map(merged.map((it) => [it.path, it]));
     renderImportItems(merged);
 
@@ -2312,6 +2404,7 @@ async function parseImportList(opts = {}) {
     let albumN = 0;
     let inboxN = 0;
     let guard = 0;
+    let lastProcessed = -1;
     while (guard++ < 500) {
       const body = { offset, limit: CHUNK };
       if (onlyPaths) body.paths = onlyPaths;
@@ -2334,12 +2427,12 @@ async function parseImportList(opts = {}) {
       inboxN += Number(data.duplicate_inbox || 0);
       const processed = Number(data.processed || offset + chunk.length);
       const pct = total ? Math.min(100, Math.round((processed / total) * 100)) : 100;
-      if ($("#drop-status")) {
-        $("#drop-status").textContent =
-          data.message || `正在解析… ${processed}/${total}（${pct}%）`;
-      }
+      setDropStatus(data.message || `正在解析… ${processed}/${total}（${pct}%）`, "busy");
       // 每片回填 UI，让用户看到进度而不是卡住
       renderImportItems(merged);
+      // 防死循环：进度不前进则结束
+      if (processed <= lastProcessed && !chunk.length) break;
+      lastProcessed = processed;
       offset = processed;
       if (data.done || !chunk.length || processed >= total) break;
       await new Promise((r) => requestAnimationFrame(() => r()));
@@ -2368,9 +2461,13 @@ async function parseImportList(opts = {}) {
       albumN || inboxN
         ? `解析完成：相册重复 ${albumN} · 待入库内重复 ${inboxN}`
         : "解析完成：未发现重复";
-    if ($("#drop-status")) $("#drop-status").textContent = msg;
+    setDropStatus(msg, albumN || inboxN ? "warn" : "ok");
   } catch (e) {
+    setDropStatus(e.message || String(e), "error");
     alert(e.message);
+  } finally {
+    parseState.running = false;
+    if (btnParse) btnParse.disabled = false;
   }
 }
 
@@ -2390,8 +2487,8 @@ async function discardSelectedImport() {
     method: "POST",
     body: JSON.stringify({ paths }),
   });
-  $("#drop-status").textContent = `已移除 ${r.removed || 0} 项`;
-  await loadImport();
+  setDropStatus(`已移除 ${r.removed || 0} 项`, "ok");
+  await loadImport({ quiet: true });
 }
 
 async function clearAllImport() {
@@ -2410,8 +2507,9 @@ async function clearAllImport() {
     method: "POST",
     body: JSON.stringify({ clear_all: true }),
   });
-  $("#drop-status").textContent = `已清空待入库（移除 ${r.removed || 0} 项）`;
-  await loadImport();
+  state.importOutcomes?.clear();
+  setDropStatus(`已清空待入库（移除 ${r.removed || 0} 项）`, "ok");
+  await loadImport({ quiet: true });
 }
 
 function bindImportToolbarOnce() {
@@ -2421,18 +2519,16 @@ function bindImportToolbarOnce() {
   const onErr = (err) => {
     console.error(err);
     const msg = err?.message || String(err);
-    if ($("#drop-status")) $("#drop-status").textContent = msg;
+    setDropStatus(msg, "error");
     askConfirm(msg).catch(() => {});
   };
 
   $("#btn-reload-import")?.addEventListener("click", () => {
     ensureImportListEl();
-    if ($("#drop-status")) $("#drop-status").textContent = "正在刷新待入库列表…";
     loadImport().catch(onErr);
   });
   $("#btn-parse")?.addEventListener("click", () => {
     ensureImportListEl();
-    if ($("#drop-status")) $("#drop-status").textContent = "正在重新解析元数据…";
     parseImportList().catch(onErr);
   });
   $("#btn-select-same-day")?.addEventListener("click", () => {
@@ -3807,7 +3903,7 @@ async function runIngestSelected() {
   if (ingestState.running) {
     const stuckMs = Date.now() - (ingestState.startedAt || 0);
     if (stuckMs < 180000) {
-      $("#drop-status").textContent = "正在入库中…可点右侧「取消入库」停止";
+      setDropStatus("正在入库中…可点右侧「取消入库」停止", "busy");
       setIngestProgress({ show: true });
       return;
     }
@@ -3820,7 +3916,7 @@ async function runIngestSelected() {
   const items = collectIngestItems();
   if (!items.length) {
     const msg = "请先勾选要入库的项目（未勾选的不会入库）";
-    $("#drop-status").textContent = msg;
+    setDropStatus(msg, "warn");
     alert(msg);
     return;
   }
@@ -3853,9 +3949,10 @@ async function runIngestSelected() {
       `本批准备处理 ${Math.min(BATCH, items.length)} 项`,
     percent: 2,
   });
-  $("#drop-status").textContent = `正在入库 0/${items.length}…`;
+  setDropStatus(`正在入库 0/${items.length}…`, "busy");
   try {
     $("#ingest-progress")?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+    $("#import-status")?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
   } catch (_) {}
 
   try {
@@ -3877,7 +3974,7 @@ async function runIngestSelected() {
         detail: `本批 ${batch.length} 项：${label.slice(0, 80)}${label.length > 80 ? "…" : ""}`,
         percent: (start / items.length) * 100,
       });
-      $("#drop-status").textContent = `正在入库 ${start + 1}-${start + batch.length}/${items.length}`;
+      setDropStatus(`正在入库 ${start + 1}-${start + batch.length}/${items.length}`, "busy");
       try {
         const data = await api("/api/import/ingest", {
           method: "POST",
@@ -3897,6 +3994,8 @@ async function runIngestSelected() {
         for (let bi = 0; bi < batch.length; bi++) {
           const it = batch[bi];
           const r = batchResults[bi] || { ok: false, path: it.path, message: "无返回" };
+          // 保证失败结果带上来源 path，刷新后还能对上
+          if (!r.path) r.path = it.path;
           results.push(r);
           if (r.ok) {
             okN += 1;
@@ -3931,33 +4030,71 @@ async function runIngestSelected() {
         .join("\n");
     }
     const cancelled = ingestState.cancel;
+    if (!state.importOutcomes) state.importOutcomes = new Map();
+    // results 与 items 同序；成功时 r.path 是相册路径，失败标记必须用待入库源路径
+    for (let i = 0; i < results.length; i++) {
+      const srcPath = items[i]?.path || "";
+      if (!srcPath) continue;
+      const r = results[i] || {};
+      if (r.ok) state.importOutcomes.delete(srcPath);
+      else {
+        state.importOutcomes.set(srcPath, {
+          ok: false,
+          message: r.message || "入库失败",
+        });
+      }
+    }
+    const tone = failN ? "fail" : "ok";
     setIngestProgress({
       show: true,
-      title: cancelled ? "入库已停止" : "入库完成",
+      title: cancelled ? "入库已停止" : failN ? "入库完成（有失败）" : "入库完成",
       summary: `成功 ${okN} · 失败 ${failN} · 合计 ${results.length}`,
       detail: cancelled
         ? "已停止后续项目；成功的已写入相册，失败/未处理项仍在待入库列表。"
         : failN
-          ? "请查看下方日志。失败项仍留在待入库，可修改后重试。"
+          ? "失败项仍留在待入库，列表已标红并可重试；详情见下方日志。"
           : "选中项已全部处理。",
       percent: 100,
+      tone,
     });
-    $("#drop-status").textContent = cancelled
-      ? `入库已停止：成功 ${okN}，未处理 ${results.length - okN}`
-      : `入库完成：成功 ${okN}，失败 ${failN}`;
+    setDropStatus(
+      cancelled
+        ? `入库已停止：成功 ${okN}，未处理/失败 ${results.length - okN}`
+        : failN
+          ? `入库完成：成功 ${okN}，失败 ${failN}（失败项仍在列表中）`
+          : `入库完成：成功 ${okN}`,
+      failN || cancelled ? "warn" : "ok"
+    );
 
-    await loadImport();
-    // 大纲走 SQLite，不必强制重扫盘；入库时已清浏览缓存
-    await loadTree(false).catch(console.error);
+    // 先刷新待入库（保留失败标记），浏览树放到后台，避免像「刷新一直不结束」
+    setDropStatus(
+      failN
+        ? `正在刷新待入库列表（保留 ${failN} 项失败标记）…`
+        : "正在刷新待入库列表…",
+      "busy"
+    );
+    await loadImport({ quiet: true });
+    const leftFail = [...(state.importOutcomes?.values() || [])].filter((x) => x && x.ok === false).length;
+    setDropStatus(
+      cancelled
+        ? `入库已停止：成功 ${okN} · 待入库仍有失败/未处理项`
+        : leftFail
+          ? `入库完成：成功 ${okN}，失败 ${leftFail}（已标红，可改完再入库）`
+          : `入库完成：成功 ${okN}，待入库已更新`,
+      leftFail || cancelled ? "warn" : "ok"
+    );
+    loadTree(false).catch(console.error);
     invalidateMapData().catch(() => {});
   } catch (e) {
     alert(e.message);
+    setDropStatus(e.message || String(e), "error");
     setIngestProgress({
       show: true,
       title: "入库中断",
       summary: "",
       detail: e.message || String(e),
       percent: 0,
+      tone: "fail",
     });
   } finally {
     ingestState.running = false;

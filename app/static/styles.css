@@ -2797,7 +2797,71 @@ dialog.lightbox[open] {
 }
 .drop-sub { margin: 0.25rem 0 0.8rem; color: var(--muted); font-size: 0.92rem; }
 .drop-actions { display: flex; justify-content: center; gap: 0.5rem; flex-wrap: wrap; }
-.drop-status { min-height: 1.2em; margin: 0.7rem 0 0; color: var(--leaf-deep); font-size: 0.9rem; }
+.drop-status {
+  min-height: 1.2em;
+  margin: 0.7rem 0 0;
+  color: var(--leaf-deep);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.drop-status.is-busy { color: var(--leaf-deep); }
+.drop-status.is-ok { color: #0f766e; }
+.drop-status.is-warn { color: #b45309; }
+.drop-status.is-error { color: #b91c1c; }
+
+.import-status {
+  display: none;
+  margin: 0.65rem 0 0.55rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.import-status:not([hidden]) { display: block; }
+.import-status.is-busy {
+  border-color: color-mix(in srgb, var(--leaf) 45%, var(--line));
+  background: color-mix(in srgb, var(--leaf) 12%, var(--panel));
+  color: var(--leaf-deep);
+}
+.import-status.is-ok {
+  border-color: color-mix(in srgb, #0f766e 40%, var(--line));
+  background: color-mix(in srgb, #14b8a6 12%, var(--panel));
+  color: #0f766e;
+}
+.import-status.is-warn {
+  border-color: color-mix(in srgb, #d97706 45%, var(--line));
+  background: color-mix(in srgb, #f59e0b 14%, var(--panel));
+  color: #92400e;
+}
+.import-status.is-error {
+  border-color: color-mix(in srgb, #dc2626 45%, var(--line));
+  background: color-mix(in srgb, #ef4444 12%, var(--panel));
+  color: #991b1b;
+}
+.import-fail-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin: 0.2rem 0.35rem 0.2rem 0;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #dc2626 50%, transparent);
+  background: color-mix(in srgb, #ef4444 16%, var(--panel));
+  color: #991b1b;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+.import-fail-msg {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  color: #991b1b;
+  font-weight: 600;
+  line-height: 1.35;
+}
 .year, .month, .import-item, .empty {
   backdrop-filter: blur(10px);
 }
@@ -4213,11 +4277,19 @@ body.is-mobile dialog.lightbox.is-fit .lb-live-video {
 /* 入库进度：与上传队列 / 主题变量对齐 */
 .ingest-progress {
   margin: 0.75rem 0 1rem;
-  padding: 0.7rem 0.85rem;
+  padding: 0.75rem 0.9rem;
   border-radius: 14px;
-  border: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 90%, transparent);
-  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--leaf) 35%, var(--line));
+  background: color-mix(in srgb, var(--leaf) 8%, var(--panel));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--leaf) 12%, transparent);
+}
+.ingest-progress.is-done-ok {
+  border-color: color-mix(in srgb, #0f766e 40%, var(--line));
+  background: color-mix(in srgb, #14b8a6 10%, var(--panel));
+}
+.ingest-progress.is-done-fail {
+  border-color: color-mix(in srgb, #dc2626 45%, var(--line));
+  background: color-mix(in srgb, #ef4444 10%, var(--panel));
 }
 .ingest-progress-head {
   display: flex;
@@ -4227,12 +4299,12 @@ body.is-mobile dialog.lightbox.is-fit .lb-live-video {
   margin-bottom: 0.5rem;
 }
 .ingest-progress-head strong {
-  font-size: 0.95rem;
-  font-weight: 600;
+  font-size: 1rem;
+  font-weight: 700;
   color: var(--ink);
 }
 .ingest-progress-bar {
-  height: 4px;
+  height: 8px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--leaf) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--leaf) 18%, transparent);
@@ -4249,8 +4321,9 @@ body.is-mobile dialog.lightbox.is-fit .lb-live-video {
 }
 .ingest-progress-detail {
   margin: 0.5rem 0 0;
-  font-size: 0.86rem;
-  color: var(--muted);
+  font-size: 0.9rem;
+  color: var(--ink);
+  font-weight: 600;
   word-break: break-all;
   line-height: 1.4;
 }
@@ -4263,6 +4336,7 @@ body.is-mobile dialog.lightbox.is-fit .lb-live-video {
   opacity: 0.62;
 }
 .import-item.is-ingest-fail {
-  border-color: color-mix(in srgb, #c2410c 55%, var(--line));
-  background: color-mix(in srgb, #c2410c 8%, var(--panel));
+  border-color: color-mix(in srgb, #dc2626 60%, var(--line));
+  background: color-mix(in srgb, #ef4444 12%, var(--panel));
+  box-shadow: 0 0 0 1px color-mix(in srgb, #dc2626 28%, transparent);
 }
