@@ -3797,7 +3797,12 @@ dialog.lightbox[open] {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
+  gap: 0.6rem;
   margin-bottom: 0.65rem;
+}
+.search-more {
+  display: block;
+  margin: 0.85rem auto 0.2rem;
 }
 .storage-group {
   border: 1px solid var(--line);

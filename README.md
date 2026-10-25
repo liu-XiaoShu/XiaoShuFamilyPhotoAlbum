@@ -6,13 +6,13 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-v3.0.8-0e9fbf?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-v3.0.9-0e9fbf?style=flat-square" />
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square" />
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20Raspberry%20Pi-informational?style=flat-square" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
 </p>
 
-**作者：** xiaoshu · **邮箱：** [liu_xiaoshu@163.com](mailto:liu_xiaoshu@163.com) · **版本：** v3.0.8（更新时间 2026-10-11）
+**作者：** xiaoshu · **邮箱：** [liu_xiaoshu@163.com](mailto:liu_xiaoshu@163.com) · **版本：** v3.0.9（更新时间 2026-10-25）
 
 把照片和视频按时间整理到本机目录，在浏览器里浏览、编辑、下载，并通过二维码在局域网内分享给家人。适合树莓派 / NAS 一类常开小主机。
 
@@ -20,9 +20,10 @@
 
 ---
 
-## 特性（v3.0.8）
+## 特性（v3.0.9）
 
-- **时光 / 经典 / 地图** 三种浏览；点「搜索」展开检索（标题 / 地点 / 描述 / 文件名）
+- **时光 / 经典 / 地图** 三种浏览；点「搜索」展开检索（标题 / 地点 / 描述 / 感悟 / 文件名）
+- **搜索**：多词空格分词（需同时命中）；支持「仅照片 / 仅视频」；结果可「加载更多」翻完；分享选图同样支持翻页
 - **入库**：拖放或多选；自动解析 EXIF；上传队列（暂停 / 继续 / 重试）；**内容指纹**写入索引，待入库会标出相册里已有的相同内容（忽略元数据，只认画面/视频载荷；重新压缩或改尺寸不算同一份）
 - 无拍摄时间时可从**文件名**回填日期；不要的文件可「移除选中 / 清空待入库」
 - **苹果 HEIC / 实况**：原件入库；看图可「实况」预览伴生视频
@@ -49,8 +50,8 @@
 ### 本地运行
 
 ```bash
-git clone <你的仓库地址>.git
-cd xiaoshu-album
+git clone https://github.com/liu-XiaoShu/XiaoShuFamilyPhotoAlbum.git
+cd XiaoShuFamilyPhotoAlbum
 
 python3 -m pip install --target .vendor -r requirements.txt
 cp config.example.json config.json
@@ -74,6 +75,7 @@ python3 run.py --http   # 明文 HTTP（仅调试）
 
 ```bash
 cp -n config.example.json config.json
+# 外接盘部署可参考：cp -n config.pi.example.json config.json
 mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 
 ./scripts/pi/deploy.sh    # 构建并启动
@@ -85,7 +87,9 @@ mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 
 等价：`sudo docker-compose up -d --build`
 
-当前部署默认 **HTTPS**。compose 可配置 `HOST_UID` / `HOST_GID`，便于新写入文件归属宿主机用户。相册放到外接盘时，**待入库请与相册同盘**，避免入库时跨盘拷贝。
+当前部署默认 **HTTPS**。compose 可配置 `HOST_UID` / `HOST_GID`（改成你的宿主机用户 id），便于新写入文件归属正确。相册放到外接盘时，**待入库请与相册同盘**，避免入库时跨盘拷贝。
+
+仓库里的 `docker-compose.yml` / `docker-compose.pi.yml` 使用示例路径 `/mnt/album-data`，部署时请改成你自己的挂载点。
 
 ---
 
@@ -93,7 +97,7 @@ mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 
 | 文档 | 内容 |
 |------|------|
-| [doc/版本说明.md](./doc/版本说明.md) | **v3.0.8 更新范围（含 v3.0.0 / v2.1.0 / v2.0.0）** |
+| [doc/版本说明.md](./doc/版本说明.md) | **v3.0.9 更新范围（含 v3.0.8 / v3.0.0 / v2.1.0 / v2.0.0）** |
 | [doc/使用说明.md](./doc/使用说明.md) | 日常：入库、浏览、搜索、下载、分享、存储与去重 |
 | [doc/部署使用说明.md](./doc/部署使用说明.md) | Docker、一键脚本、启停、重置密码、备份 |
 | [doc/设计需求.md](./doc/设计需求.md) | 产品目标、架构、版本决策 |
@@ -104,7 +108,7 @@ mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 ## 目录结构
 
 ```text
-xiaoshu-album/
+XiaoShuFamilyPhotoAlbum/
 ├── app/                 # FastAPI 后端 + 静态前端
 ├── doc/                 # 产品与运维文档
 ├── scripts/pi/          # 一键部署 / 启动 / 重启 / 调试
@@ -117,9 +121,10 @@ xiaoshu-album/
 │   ├── map_pack/        # 离线地图说明（瓦片不入库）
 │   └── …                # auth / visitors / thumbs / brand / certs（运行时）
 ├── config.example.json
+├── config.pi.example.json   # 外接盘路径示例（可改）
 ├── Dockerfile
-├── docker-compose.yml       # 当前仓库：树莓派 USB 盘示例
-├── docker-compose.pi.yml    # 同上，便于对照
+├── docker-compose.yml       # 外接盘示例（路径请改）
+├── docker-compose.pi.yml
 ├── requirements.txt
 └── run.py
 ```
@@ -130,7 +135,7 @@ xiaoshu-album/
 - `data/auth.sqlite`、`data/visitors.sqlite`、`data/geo/*.sqlite`
 - `data/brand/`、`data/certs/`、`data/thumbs/`、地图瓦片缓存
 
-公开仓库请用干净克隆；**不要**把家庭照片、访客 IP、超管库推上 Git。
+公开仓库请用干净克隆；**不要**把家庭照片、访客 IP、超管库、本机绝对路径、账号口令推上 Git。
 
 ---
 
@@ -138,7 +143,7 @@ xiaoshu-album/
 
 1. 创建超级用户并登录（默认进入**时光**浏览）  
 2. **管理 → 入库**：选择/拖入 → 自动解析 → 可编辑后「入库选中项」；不要的用「移除选中」  
-3. **浏览**：时光 / 经典 / 地图；需要时点「搜索」；看图可「下载 / 实况 / 编辑」  
+3. **浏览**：时光 / 经典 / 地图；需要时点「搜索」（多词空格、可加载更多）；看图可「下载 / 实况 / 编辑」  
 4. **管理 → 存储**（超管）：看磁盘占用；「检查重复项」并处理  
 5. **设置**：品牌、主题、地图、分享二维码  
 6. **访问数据**：访客与入库占比（超管）  
@@ -165,7 +170,7 @@ xiaoshu-album/
 
 Copyright (c) 2026 xiaoshu <liu_xiaoshu@163.com>
 
-作者 **xiaoshu** · 版本 **v3.0.8** · 更新时间 **2026-10-11**
+作者 **xiaoshu** · 版本 **v3.0.9** · 更新时间 **2026-10-25**
 
 ---
 

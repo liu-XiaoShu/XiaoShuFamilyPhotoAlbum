@@ -6151,7 +6151,7 @@ $("#btn-share-media-all")?.addEventListener("click", () => {
   shareSelectPaths(paths, !allOn);
 });
 
-async function runShareSearch(q) {
+async function runShareSearch(q, offset = 0) {
   const grid = $("#share-search-grid");
   const text = String(q || "").trim();
   if (!grid) return;
@@ -6161,22 +6161,48 @@ async function runShareSearch(q) {
     updateShareMediaCount();
     return;
   }
-  grid.innerHTML = `<p class="muted share-month-head">搜索中…</p>`;
-  const qs = new URLSearchParams({ q: text, limit: "120" });
+  const appending = offset > 0;
+  if (!appending) {
+    grid.innerHTML = `<p class="muted share-month-head">搜索中…</p>`;
+    state.shareSearchItems = [];
+  }
+  const qs = new URLSearchParams({ q: text, limit: "200", offset: String(offset) });
   const data = await api(`/api/search?${qs.toString()}`);
   const items = data.items || [];
-  state.shareSearchItems = items;
-  grid.innerHTML = "";
-  if (!items.length) {
+  const total = Number(data.total || 0);
+  if (!appending) {
+    state.shareSearchItems = items;
+    grid.innerHTML = "";
+  } else {
+    state.shareSearchItems = state.shareSearchItems.concat(items);
+    grid.querySelector("#share-search-more")?.remove();
+  }
+  if (!state.shareSearchItems.length) {
     grid.innerHTML = `<p class="muted share-month-head">没有匹配「${escapeHtml(text)}」的内容</p>`;
     updateShareMediaCount();
     return;
   }
-  const head = document.createElement("div");
-  head.className = "share-month-head muted";
-  head.textContent = `找到 ${data.total} 项，显示 ${items.length} 项`;
-  grid.appendChild(head);
+  let head = grid.querySelector(".share-month-head");
+  if (!head) {
+    head = document.createElement("div");
+    head.className = "share-month-head muted";
+    grid.prepend(head);
+  }
+  const shown = state.shareSearchItems.length;
+  head.textContent = `找到 ${total} 项，已显示 ${shown} 项`;
   items.forEach((p) => appendShareMediaItem(grid, p));
+  if (items.length && (data.has_more || shown < total)) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.id = "share-search-more";
+    more.className = "btn ghost search-more";
+    more.textContent = `加载更多（已 ${shown} / ${total}）`;
+    more.addEventListener("click", () => {
+      more.disabled = true;
+      runShareSearch(text, shown).catch((err) => alert(err.message || err));
+    });
+    grid.appendChild(more);
+  }
   updateShareMediaCount();
 }
 
@@ -7755,7 +7781,15 @@ $("#btn-trash-purge")?.addEventListener("click", async () => {
 
 
 /* —— 搜索模式 —— */
-async function runSearch(q) {
+let searchSeq = 0;
+
+function paintSearchHead(total, shown, kind) {
+  const kindHint =
+    kind === "video" ? "（仅视频）" : kind === "image" ? "（仅照片）" : "（照片+视频）";
+  return `<strong>找到 ${total} 项</strong><span class="muted">已显示 ${shown} 项 ${kindHint}</span>`;
+}
+
+async function runSearch(q, offset = 0) {
   const results = $("#search-results") || $("#search-root");
   if (!results) return;
   const text = (q || "").trim();
@@ -7763,37 +7797,70 @@ async function runSearch(q) {
     clearSearch();
     return;
   }
+  const appending = offset > 0;
+  const seq = appending ? searchSeq : ++searchSeq;
   if (state.viewMode !== "search") {
     state.viewMode = "search";
     localStorage.setItem("xiaoshu_view", "search");
     applyViewMode();
   }
   const box = $("#search-results") || results;
-  box.innerHTML = `<p class="muted">正在从索引库搜索…</p>`;
+  if (!appending) {
+    box.innerHTML = `<p class="muted">正在从索引库搜索…</p>`;
+    state.searchGallery = [];
+  }
   $("#btn-search-clear")?.classList.remove("hidden");
   const kind = mediaKindQuery();
-  const qs = new URLSearchParams({ q: text, limit: "80" });
+  const qs = new URLSearchParams({
+    q: text,
+    limit: "200",
+    offset: String(offset),
+  });
   if (kind) qs.set("kind", kind);
   const data = await api(`/api/search?${qs.toString()}`);
+  if (seq !== searchSeq) return;
   const items = data.items || [];
-  if (!items.length) {
+  const total = Number(data.total || 0);
+  if (!items.length && !appending) {
     const kindLabel = kind === "video" ? "视频" : kind === "image" ? "照片" : "内容";
     box.innerHTML = `<p class="empty">没有匹配「${escapeHtml(text)}」的${kindLabel}</p>`;
     return;
   }
-  const paths = items.map((x) => x.path);
-  const kindHint =
-    kind === "video" ? "（仅视频）" : kind === "image" ? "（仅照片）" : "（照片+视频）";
-  box.innerHTML = `<div class="search-head"><strong>找到 ${data.total} 项</strong><span class="muted">显示 ${items.length} 项 ${kindHint}</span></div>
-    <div class="photo-grid search-grid" id="search-grid"></div>`;
-  const grid = $("#search-grid");
+  if (!state.searchGallery) state.searchGallery = [];
+  if (!appending) state.searchGallery.length = 0;
+  items.forEach((p) => state.searchGallery.push(p.path));
+  let grid = appending ? $("#search-grid") : null;
+  if (!grid) {
+    box.innerHTML = `<div class="search-head">${paintSearchHead(total, items.length, kind)}</div>
+      <div class="photo-grid search-grid" id="search-grid"></div>`;
+    grid = $("#search-grid");
+  } else {
+    const head = box.querySelector(".search-head");
+    if (head) head.innerHTML = paintSearchHead(total, state.searchGallery.length, kind);
+    box.querySelector("#search-more")?.remove();
+  }
   items.forEach((p) => {
-    grid.appendChild(makePhotoCard(p, paths));
+    grid.appendChild(makePhotoCard(p, state.searchGallery));
   });
   bindAlbumThumbLazy(grid);
+  const shown = state.searchGallery.length;
+  if (items.length && (data.has_more || shown < total)) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.id = "search-more";
+    more.className = "btn ghost search-more";
+    more.textContent = `加载更多（已 ${shown} / ${total}）`;
+    more.addEventListener("click", () => {
+      more.disabled = true;
+      runSearch(text, shown).catch((err) => alert(err.message || err));
+    });
+    box.appendChild(more);
+  }
 }
 
 function clearSearch() {
+  searchSeq += 1;
+  state.searchGallery = [];
   const box = $("#search-results");
   if (box) box.innerHTML = "";
   $("#btn-search-clear")?.classList.add("hidden");

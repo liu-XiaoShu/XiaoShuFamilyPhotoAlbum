@@ -82,6 +82,8 @@ def init_media_tables() -> None:
             con.execute("ALTER TABLE media ADD COLUMN uploaded_by_share_id INTEGER")
         if "content_hash" not in cols:
             con.execute("ALTER TABLE media ADD COLUMN content_hash TEXT")
+        if "reflection" not in cols:
+            con.execute("ALTER TABLE media ADD COLUMN reflection TEXT")
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_media_uploader ON media(uploaded_by_share_id)"
         )
@@ -200,6 +202,7 @@ def _row_from_file(path: Path, rel: str) -> dict[str, Any] | None:
         "datetime": meta.datetime,
         "title": meta.title,
         "description": meta.description,
+        "reflection": meta.reflection,
         "location": meta.location,
         "lat": lat,
         "lng": lng,
@@ -281,13 +284,14 @@ def upsert_media(
                 """
                 INSERT INTO media(
                   path, name, kind, year, month, datetime, title, description,
-                  location, lat, lng, has_audio, mtime, size, updated_at,
+                  reflection, location, lat, lng, has_audio, mtime, size, updated_at,
                   uploaded_by_share_id, content_hash
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                   name=excluded.name, kind=excluded.kind, year=excluded.year,
                   month=excluded.month, datetime=excluded.datetime, title=excluded.title,
-                  description=excluded.description, location=excluded.location,
+                  description=excluded.description, reflection=excluded.reflection,
+                  location=excluded.location,
                   lat=excluded.lat, lng=excluded.lng, has_audio=excluded.has_audio,
                   mtime=excluded.mtime, size=excluded.size, updated_at=excluded.updated_at,
                   uploaded_by_share_id=COALESCE(
@@ -306,6 +310,7 @@ def upsert_media(
                     row["datetime"],
                     row["title"],
                     row["description"],
+                    row.get("reflection"),
                     row["location"],
                     row["lat"],
                     row["lng"],
@@ -413,9 +418,9 @@ def rebuild_index(*, force: bool = False) -> dict:
                 """
                 INSERT INTO media(
                   path, name, kind, year, month, datetime, title, description,
-                  location, lat, lng, has_audio, mtime, size, updated_at,
+                  reflection, location, lat, lng, has_audio, mtime, size, updated_at,
                   uploaded_by_share_id, content_hash
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -427,6 +432,7 @@ def rebuild_index(*, force: bool = False) -> dict:
                         r["datetime"],
                         r["title"],
                         r["description"],
+                        r.get("reflection"),
                         r["location"],
                         r["lat"],
                         r["lng"],
@@ -1101,6 +1107,7 @@ def indexed_photo(album_rel: str) -> dict | None:
             "datetime": d.get("datetime"),
             "title": d.get("title"),
             "description": d.get("description"),
+            "reflection": d.get("reflection"),
             "location": d.get("location"),
             "lat": d.get("lat"),
             "lng": d.get("lng"),
@@ -1193,32 +1200,73 @@ def duplicate_groups(*, limit: int = 200) -> dict:
     }
 
 
+_SEARCH_FIELDS = (
+    "IFNULL(title,'')",
+    "IFNULL(description,'')",
+    "IFNULL(reflection,'')",
+    "IFNULL(location,'')",
+    "IFNULL(name,'')",
+    "IFNULL(path,'')",
+    "IFNULL(datetime,'')",
+)
+
+
+def _search_tokens(text: str) -> list[str]:
+    """按空白拆词。每个词都要命中，避免「北京 西湖」被当成一整句而漏掉。"""
+    out: list[str] = []
+    for part in (text or "").replace("\u3000", " ").split():
+        token = part.strip()
+        if not token or token in out:
+            continue
+        out.append(token)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _like_pattern(token: str) -> str:
+    escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def search_media(
     q: str,
     *,
-    limit: int = 60,
+    limit: int = 120,
     offset: int = 0,
+    kind: str | None = None,
     scopes: list[str] | None = None,
     media_paths: list[str] | None = None,
     uploaded_by_share_id: int | None = None,
 ) -> dict:
     init_media_tables()
     text = (q or "").strip()
-    if not text:
-        return {"items": [], "total": 0, "q": q, "limit": limit, "offset": offset}
-    limit = max(1, min(int(limit or 60), 200))
+    tokens = _search_tokens(text)
+    limit = max(1, min(int(limit or 120), 500))
     offset = max(0, int(offset or 0))
-    like = f"%{text}%"
+    empty = {
+        "items": [],
+        "total": 0,
+        "q": text,
+        "limit": limit,
+        "offset": offset,
+        "has_more": False,
+    }
+    if not tokens:
+        return empty
     where_scope, args_scope = _scope_clause(scopes, media_paths, uploaded_by_share_id)
-    sql_where = (
-        " WHERE ("
-        " IFNULL(title,'') LIKE ? OR IFNULL(description,'') LIKE ?"
-        " OR IFNULL(location,'') LIKE ? OR IFNULL(name,'') LIKE ?"
-        " OR IFNULL(path,'') LIKE ? OR IFNULL(datetime,'') LIKE ?"
-        " )"
-        + where_scope
-    )
-    args = [like, like, like, like, like, like] + args_scope
+    clauses: list[str] = []
+    args: list[Any] = []
+    field_or = " OR ".join(f"{field} LIKE ? ESCAPE '\\'" for field in _SEARCH_FIELDS)
+    for token in tokens:
+        clauses.append(f"({field_or})")
+        args.extend([_like_pattern(token)] * len(_SEARCH_FIELDS))
+    media_kind = (kind or "").strip().lower()
+    if media_kind in ("image", "video"):
+        clauses.append("kind = ?")
+        args.append(media_kind)
+    sql_where = " WHERE " + " AND ".join(clauses) + where_scope
+    args = args + args_scope
     with connect() as con:
         total = con.execute(
             f"SELECT COUNT(*) AS c FROM media{sql_where}", args
@@ -1239,10 +1287,12 @@ def search_media(
         d = _photo_dict(r)
         d["size"] = r["size"]
         items.append(d)
+    total_n = int(total)
     return {
         "items": items,
-        "total": int(total),
+        "total": total_n,
         "q": text,
         "limit": limit,
         "offset": offset,
+        "has_more": offset + len(items) < total_n,
     }

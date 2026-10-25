@@ -49,7 +49,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="小树时光相册", version="3.0.8", lifespan=lifespan)
+app = FastAPI(title="小树时光相册", version="3.0.9", lifespan=lifespan)
 
 
 def _skip_visitor_log(path: str) -> bool:
@@ -365,8 +365,8 @@ def health():
     return {
         "ok": True,
         "name": config.album_title,
-        "version": "3.0.8",
-        "released_at": "2026-10-11",
+        "version": "3.0.9",
+        "released_at": "2026-10-25",
         "author": "xiaoshu",
     }
 
@@ -1021,14 +1021,16 @@ def storage_stats(force: bool = False, p: dict = Depends(require_settings)):
 @app.get("/api/search")
 def search_photos(
     q: str = "",
-    limit: int = 60,
+    limit: int = 120,
     offset: int = 0,
+    kind: str = "",
     p: dict = Depends(current_principal),
 ):
     return media_index.search_media(
         q,
         limit=limit,
         offset=offset,
+        kind=kind,
         **_scope_kwargs(p),
     )
 
