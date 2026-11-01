@@ -8,12 +8,6 @@ __pycache__/
 .DS_Store
 *.AppImage
 
-.env
-.env.*
-*.pem
-*.key
-config.json.bad_dir
-
 # 本机配置（含绝对路径 / 个性化标题）
 config.json
 

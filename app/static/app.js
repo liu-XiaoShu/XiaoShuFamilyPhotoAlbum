@@ -53,6 +53,12 @@ const state = {
   importItemCount: 0,
   /** @type {Map<string, {ok:boolean, message:string}>} 入库结果，刷新列表后仍保留失败标记 */
   importOutcomes: new Map(),
+  /**
+   * 待入库已解析的元数据/指纹缓存。
+   * /api/import/list 默认不带 EXIF，入库后刷新若直接重绘会丢；用此 Map 合并保留。
+   * @type {Map<string, object>}
+   */
+  importParsedCache: new Map(),
   _detachedImportList: null,
   _importListParent: null,
   map: null,
@@ -2047,6 +2053,20 @@ function buildImportRow(it) {
   if (it.duplicate) row.dataset.duplicate = "1";
   if (it.inbox_duplicate) row.dataset.inboxDuplicate = "1";
   if (it.duplicate || it.inbox_duplicate) row.classList.add("is-duplicate");
+  if (Array.isArray(it.duplicate_of) && it.duplicate_of.length) {
+    try {
+      row.dataset.duplicateOf = JSON.stringify(it.duplicate_of);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  if (Array.isArray(it.inbox_duplicate_of) && it.inbox_duplicate_of.length) {
+    try {
+      row.dataset.inboxDuplicateOf = JSON.stringify(it.inbox_duplicate_of);
+    } catch (_) {
+      /* ignore */
+    }
+  }
   const meta = it.meta || {};
   row.dataset.datetime = toLocalInput(meta.datetime);
   row.dataset.title = meta.title || "";
@@ -2151,6 +2171,112 @@ function ensureImportListEl() {
   return list;
 }
 
+function _parseJsonArr(raw) {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter(Boolean) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+/** 从当前 DOM 收集已填/已解析字段（含用户改过的输入框） */
+function snapshotImportParsedFromDom() {
+  const map = new Map();
+  const root = importListRoot();
+  if (!root) return map;
+  root.querySelectorAll(".import-item").forEach((row) => {
+    const path = row.dataset.path;
+    if (!path) return;
+    const datetime =
+      fromLocalInput(row.querySelector(".f-datetime")?.value || "") ||
+      row.dataset.datetime ||
+      "";
+    const title = row.querySelector(".f-title")?.value ?? row.dataset.title ?? "";
+    const description =
+      row.querySelector(".f-description")?.value ?? row.dataset.description ?? "";
+    const location =
+      row.querySelector(".f-location")?.value ?? row.dataset.location ?? "";
+    const content_hash = row.dataset.contentHash || "";
+    const hasMeta = Boolean(datetime || title || description || location || content_hash);
+    if (!hasMeta && row.dataset.duplicate !== "1" && row.dataset.inboxDuplicate !== "1") {
+      return;
+    }
+    map.set(path, {
+      meta: { datetime, title, description, location },
+      content_hash,
+      duplicate: row.dataset.duplicate === "1",
+      inbox_duplicate: row.dataset.inboxDuplicate === "1",
+      duplicate_of: _parseJsonArr(row.dataset.duplicateOf),
+      inbox_duplicate_of: _parseJsonArr(row.dataset.inboxDuplicateOf),
+    });
+  });
+  return map;
+}
+
+function rememberImportParsed(items) {
+  if (!state.importParsedCache) state.importParsedCache = new Map();
+  const alive = new Set();
+  for (const it of items || []) {
+    if (!it?.path) continue;
+    alive.add(it.path);
+    const meta = it.meta || {};
+    const hasMeta = Boolean(
+      meta.datetime || meta.title || meta.description || meta.location || it.content_hash
+    );
+    if (!hasMeta && !it.duplicate && !it.inbox_duplicate) continue;
+    state.importParsedCache.set(it.path, {
+      meta: {
+        datetime: meta.datetime || "",
+        title: meta.title || "",
+        description: meta.description || "",
+        location: meta.location || "",
+      },
+      content_hash: it.content_hash || "",
+      duplicate: Boolean(it.duplicate),
+      inbox_duplicate: Boolean(it.inbox_duplicate),
+      duplicate_of: Array.isArray(it.duplicate_of) ? it.duplicate_of.filter(Boolean) : [],
+      inbox_duplicate_of: Array.isArray(it.inbox_duplicate_of)
+        ? it.inbox_duplicate_of.filter(Boolean)
+        : [],
+    });
+  }
+  for (const path of [...state.importParsedCache.keys()]) {
+    if (!alive.has(path)) state.importParsedCache.delete(path);
+  }
+}
+
+/** 轻量 list 接口无 EXIF：用缓存/DOM 快照补回已解析内容 */
+function mergeImportParsed(items, extraMap) {
+  if (!state.importParsedCache) state.importParsedCache = new Map();
+  return (items || []).map((it) => {
+    const cached = extraMap?.get(it.path) || state.importParsedCache.get(it.path);
+    if (!cached) return it;
+    const meta = { ...(it.meta || {}) };
+    const emptyMeta = !(meta.datetime || meta.title || meta.description || meta.location);
+    if (emptyMeta && cached.meta) {
+      Object.assign(meta, cached.meta);
+    } else if (cached.meta) {
+      // 服务端空字段用缓存补；已有值不覆盖
+      for (const k of ["datetime", "title", "description", "location"]) {
+        if (!meta[k] && cached.meta[k]) meta[k] = cached.meta[k];
+      }
+    }
+    const out = { ...it, meta };
+    if (!out.content_hash && cached.content_hash) out.content_hash = cached.content_hash;
+    if (!out.duplicate && cached.duplicate) {
+      out.duplicate = true;
+      out.duplicate_of = cached.duplicate_of || [];
+    }
+    if (!out.inbox_duplicate && cached.inbox_duplicate) {
+      out.inbox_duplicate = true;
+      out.inbox_duplicate_of = cached.inbox_duplicate_of || [];
+    }
+    return out;
+  });
+}
+
 function renderImportItems(items) {
   document.body.classList.remove("is-batch-open");
   const list = ensureImportListEl();
@@ -2164,6 +2290,7 @@ function renderImportItems(items) {
       if (!alive.has(path)) state.importOutcomes.delete(path);
     }
   }
+  rememberImportParsed(items);
   list.innerHTML = "";
   state.importItemCount = items.length;
   const countEl = $("#import-count");
@@ -2328,9 +2455,11 @@ async function loadImport({ quiet = false } = {}) {
     }
   }
   try {
+    // 刷新前先快照 DOM，避免入库/刷新后轻量 list 冲掉已解析元数据
+    const domSnap = snapshotImportParsedFromDom();
     const data = await api("/api/import/list");
     if (empty) empty.textContent = "暂无待入库媒体，先拖入或选择文件。";
-    const items = data.items || [];
+    const items = mergeImportParsed(data.items || [], domSnap);
     renderImportItems(items);
     const failN = [...(state.importOutcomes?.values() || [])].filter((x) => x && x.ok === false).length;
     if (!quiet) {
@@ -2375,11 +2504,71 @@ function selectSameDayImport() {
   $("#drop-status").textContent = `已勾选同日 ${ref} 的照片（${n} 项）`;
 }
 
+const PARSE_SCOPE_KEY = "xiaoshu_parse_scope";
+const PARSE_SCOPE_N_KEY = "xiaoshu_parse_scope_n";
+
+function syncParseScopeUi() {
+  const sel = $("#parse-scope");
+  const inp = $("#parse-scope-n");
+  if (!sel || !inp) return;
+  const custom = sel.value === "custom";
+  inp.classList.toggle("hidden", !custom);
+  if (custom) inp.focus();
+}
+
+function readParseScopeMax() {
+  const sel = $("#parse-scope");
+  const v = sel?.value || "all";
+  if (v === "all") return null;
+  if (v === "custom") {
+    const n = Number($("#parse-scope-n")?.value || 100);
+    if (!Number.isFinite(n) || n < 1) return 100;
+    return Math.min(99999, Math.floor(n));
+  }
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function persistParseScope() {
+  try {
+    const sel = $("#parse-scope");
+    const inp = $("#parse-scope-n");
+    if (sel) localStorage.setItem(PARSE_SCOPE_KEY, sel.value || "all");
+    if (inp) localStorage.setItem(PARSE_SCOPE_N_KEY, String(inp.value || "100"));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function restoreParseScope() {
+  const sel = $("#parse-scope");
+  const inp = $("#parse-scope-n");
+  if (!sel) return;
+  try {
+    const saved = localStorage.getItem(PARSE_SCOPE_KEY);
+    if (saved && [...sel.options].some((o) => o.value === saved)) sel.value = saved;
+    const n = localStorage.getItem(PARSE_SCOPE_N_KEY);
+    if (inp && n && Number(n) > 0) inp.value = String(Math.floor(Number(n)));
+  } catch (_) {
+    /* ignore */
+  }
+  syncParseScopeUi();
+}
+
 async function parseImportList(opts = {}) {
-  const CHUNK = 40;
-  const onlyPaths = Array.isArray(opts.paths)
+  // 小分片 + 片间停顿：降低树莓派 USB 盘连续猛读掉线概率（会稍慢但更稳）
+  const CHUNK = 12;
+  const CHUNK_PAUSE_MS = 600;
+  let onlyPaths = Array.isArray(opts.paths)
     ? [...new Set(opts.paths.filter(Boolean))]
     : null;
+  // 上传后自动解析指定 paths 时不套用「解析范围」；手动点解析才用
+  let maxCount =
+    opts.maxCount != null
+      ? opts.maxCount
+      : onlyPaths
+        ? null
+        : readParseScopeMax();
   if (parseState.running) {
     setDropStatus("正在解析中，请稍候…", "busy");
     return;
@@ -2388,24 +2577,38 @@ async function parseImportList(opts = {}) {
   const btnParse = $("#btn-parse");
   if (btnParse) btnParse.disabled = true;
   try {
-    setDropStatus("正在解析元数据并比对相册指纹… 0%", "busy");
+    const scopeHint =
+      maxCount != null ? `本批最多 ${maxCount} 张` : "全部";
+    setDropStatus(
+      `正在解析元数据并比对相册指纹… 0%（${scopeHint} · 已限速）`,
+      "busy"
+    );
     // 先拿轻量列表，解析过程中逐步回填，避免长时间无反馈
     const base = await api("/api/import/list").catch(() => ({ items: [] }));
-    let merged = Array.isArray(base.items) ? base.items.slice() : [];
+    let allItems = Array.isArray(base.items) ? base.items.slice() : [];
+    let merged = allItems;
     if (onlyPaths) {
       const want = new Set(onlyPaths);
-      merged = merged.filter((it) => want.has(it.path));
+      merged = allItems.filter((it) => want.has(it.path));
+    } else if (maxCount != null) {
+      // 优先尚未解析（无 content_hash）的项，方便连续点「解析 100 张」往后推进
+      const unparsed = allItems.filter((it) => !it.content_hash);
+      const pool = unparsed.length ? unparsed : allItems;
+      const slice = pool.slice(0, maxCount);
+      onlyPaths = slice.map((it) => it.path);
+      merged = slice;
     }
-    const byPath = new Map(merged.map((it) => [it.path, it]));
-    renderImportItems(merged);
+    // 列表仍展示全部，只回填本批解析结果
+    const byPath = new Map(allItems.map((it) => [it.path, it]));
+    renderImportItems(allItems);
 
     let offset = 0;
-    let total = onlyPaths ? onlyPaths.length : merged.length || 0;
+    let total = onlyPaths ? onlyPaths.length : allItems.length || 0;
     let albumN = 0;
     let inboxN = 0;
     let guard = 0;
     let lastProcessed = -1;
-    while (guard++ < 500) {
+    while (guard++ < 2000) {
       const body = { offset, limit: CHUNK };
       if (onlyPaths) body.paths = onlyPaths;
       const data = await api("/api/import/parse", {
@@ -2419,7 +2622,7 @@ async function parseImportList(opts = {}) {
           Object.assign(byPath.get(it.path), it);
         } else {
           byPath.set(it.path, it);
-          merged.push(it);
+          allItems.push(it);
         }
       }
       // 分片内的待入库重复只覆盖本片；全部结束后用 content_hash 再统一标一次
@@ -2427,20 +2630,24 @@ async function parseImportList(opts = {}) {
       inboxN += Number(data.duplicate_inbox || 0);
       const processed = Number(data.processed || offset + chunk.length);
       const pct = total ? Math.min(100, Math.round((processed / total) * 100)) : 100;
-      setDropStatus(data.message || `正在解析… ${processed}/${total}（${pct}%）`, "busy");
+      setDropStatus(
+        data.message ||
+          `正在解析… ${processed}/${total}（${pct}%）（${scopeHint} · 已限速）`,
+        "busy"
+      );
       // 每片回填 UI，让用户看到进度而不是卡住
-      renderImportItems(merged);
+      renderImportItems(allItems);
       // 防死循环：进度不前进则结束
       if (processed <= lastProcessed && !chunk.length) break;
       lastProcessed = processed;
       offset = processed;
       if (data.done || !chunk.length || processed >= total) break;
-      await new Promise((r) => requestAnimationFrame(() => r()));
+      await new Promise((r) => setTimeout(r, CHUNK_PAUSE_MS));
     }
 
-    // 跨分片待入库内重复
+    // 跨分片待入库内重复（对整表）
     const hashPeers = new Map();
-    for (const it of merged) {
+    for (const it of allItems) {
       const h = (it.content_hash || "").toLowerCase();
       if (!h) continue;
       if (!hashPeers.has(h)) hashPeers.set(h, []);
@@ -2448,7 +2655,7 @@ async function parseImportList(opts = {}) {
     }
     inboxN = 0;
     albumN = 0;
-    for (const it of merged) {
+    for (const it of allItems) {
       const h = (it.content_hash || "").toLowerCase();
       const peers = h ? (hashPeers.get(h) || []).filter((p) => p !== it.path) : [];
       it.inbox_duplicate = peers.length > 0;
@@ -2456,11 +2663,16 @@ async function parseImportList(opts = {}) {
       if (it.duplicate) albumN += 1;
       else if (it.inbox_duplicate) inboxN += 1;
     }
-    renderImportItems(merged);
+    renderImportItems(allItems);
+    const left = allItems.filter((it) => !it.content_hash).length;
+    const batchNote =
+      maxCount != null
+        ? `本批 ${total} 张` + (left ? ` · 仍有 ${left} 张未解析` : " · 已全部解析过")
+        : "全部";
     const msg =
       albumN || inboxN
-        ? `解析完成：相册重复 ${albumN} · 待入库内重复 ${inboxN}`
-        : "解析完成：未发现重复";
+        ? `解析完成（${batchNote}）：相册重复 ${albumN} · 待入库内重复 ${inboxN}`
+        : `解析完成（${batchNote}）：未发现重复`;
     setDropStatus(msg, albumN || inboxN ? "warn" : "ok");
   } catch (e) {
     setDropStatus(e.message || String(e), "error");
@@ -2508,6 +2720,7 @@ async function clearAllImport() {
     body: JSON.stringify({ clear_all: true }),
   });
   state.importOutcomes?.clear();
+  state.importParsedCache?.clear();
   setDropStatus(`已清空待入库（移除 ${r.removed || 0} 项）`, "ok");
   await loadImport({ quiet: true });
 }
@@ -2527,8 +2740,15 @@ function bindImportToolbarOnce() {
     ensureImportListEl();
     loadImport().catch(onErr);
   });
+  restoreParseScope();
+  $("#parse-scope")?.addEventListener("change", () => {
+    syncParseScopeUi();
+    persistParseScope();
+  });
+  $("#parse-scope-n")?.addEventListener("change", () => persistParseScope());
   $("#btn-parse")?.addEventListener("click", () => {
     ensureImportListEl();
+    persistParseScope();
     parseImportList().catch(onErr);
   });
   $("#btn-select-same-day")?.addEventListener("click", () => {

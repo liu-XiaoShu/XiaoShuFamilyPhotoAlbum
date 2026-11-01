@@ -49,7 +49,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="小树时光相册", version="3.0.9", lifespan=lifespan)
+app = FastAPI(title="小树时光相册", version="3.0.11", lifespan=lifespan)
 
 
 def _skip_visitor_log(path: str) -> bool:
@@ -169,7 +169,8 @@ class ImportDiscard(BaseModel):
 
 class ImportParse(BaseModel):
     offset: int = 0
-    limit: int = 40
+    # 默认偏小：树莓派 + USB 盘连续猛读易掉线
+    limit: int = 12
     paths: Optional[List[str]] = None
 
 
@@ -365,8 +366,8 @@ def health():
     return {
         "ok": True,
         "name": config.album_title,
-        "version": "3.0.9",
-        "released_at": "2026-10-25",
+        "version": "3.0.11",
+        "released_at": "2026-11-01",
         "author": "xiaoshu",
     }
 
@@ -880,27 +881,43 @@ async def import_upload(
             skipped.append("/".join(parts))
         finally:
             await f.close()
+    try:
+        from .services import import_parse_cache
+
+        import_parse_cache.invalidate_list_cache()
+    except Exception:
+        pass
     return {"ok": True, "saved": saved, "skipped": skipped, "count": len(saved)}
 
 
 @app.post("/api/import/parse")
 def import_parse(body: Optional[ImportParse] = None, p: dict = Depends(require_upload)):
-    """分片解析，并用数据库里的内容指纹标出相册已有的相同文件。"""
+    """分片解析，并用数据库里的内容指纹标出相册已有的相同文件。
+
+    大批量时会限速并缓存指纹，减轻 USB 盘连续整文件读取导致掉线。
+    """
+    import time
+
+    from .services import import_parse_cache
     from .services.metadata import read_meta
     from .services.ops import content_hash_of
 
     req = body or ImportParse()
-    items = library.list_import_images(with_meta=False)
+    items = import_parse_cache.list_import_cached(
+        lambda: library.list_import_images(with_meta=False),
+        ttl=90.0,
+    )
     if req.paths:
         wanted = {str(p).replace("\\", "/").lstrip("/") for p in req.paths if p}
         items = [it for it in items if it.get("path") in wanted]
     total = len(items)
     offset = max(0, int(req.offset or 0))
-    limit = max(1, min(int(req.limit or 40), 80))
+    limit = max(1, min(int(req.limit or 12), 24))
     chunk = items[offset : offset + limit]
     out = []
     album_dups = 0
-    for it in chunk:
+    pause = import_parse_cache.parse_pause_seconds()
+    for i, it in enumerate(chunk):
         rel = it["path"]
         row = dict(it)
         full = library.import_path(rel)
@@ -909,7 +926,11 @@ def import_parse(body: Optional[ImportParse] = None, p: dict = Depends(require_u
         except Exception:
             row["meta"] = it.get("meta") or {}
         try:
-            digest = content_hash_of(full) if full.is_file() else ""
+            digest = (
+                import_parse_cache.content_hash_cached(full, content_hash_of)
+                if full.is_file()
+                else ""
+            )
         except OSError:
             digest = ""
         found = []
@@ -925,6 +946,10 @@ def import_parse(body: Optional[ImportParse] = None, p: dict = Depends(require_u
         if found:
             album_dups += 1
         out.append(row)
+        # 片内停顿，避免 USB 机械盘被连续打满
+        if pause > 0 and i + 1 < len(chunk):
+            time.sleep(pause)
+    import_parse_cache.flush_cache()
     processed = offset + len(out)
     done = processed >= total
     if done:
@@ -952,7 +977,14 @@ def import_discard(body: ImportDiscard, p: dict = Depends(require_upload)):
     """从待入库区移除（不进相册）。all=true 清空全部。"""
     if not body.all and not body.paths:
         raise HTTPException(400, "请指定要移除的路径，或 all=true 清空")
-    return library.discard_import(paths=body.paths, all_items=body.all)
+    out = library.discard_import(paths=body.paths, all_items=body.all)
+    try:
+        from .services import import_parse_cache
+
+        import_parse_cache.invalidate_list_cache()
+    except Exception:
+        pass
+    return out
 
 
 @app.post("/api/import/ingest")
@@ -1006,6 +1038,12 @@ def import_ingest(
             results.append(r)
         except Exception as e:
             results.append({"ok": False, "path": item.path, "message": str(e)})
+    try:
+        from .services import import_parse_cache
+
+        import_parse_cache.invalidate_list_cache()
+    except Exception:
+        pass
     return {"results": results}
 
 

@@ -89,10 +89,11 @@ def _flush_hashes(items: list[tuple[str, str]]) -> None:
 
 
 def _start_thumb_warm() -> None:
-    """指纹算完再补缩略图。仅当环境变量 ALBUM_WARM_THUMBS 指向本机脚本时启动。"""
+    """指纹算完再补缩略图，避免两件事同时读原片。"""
     import subprocess
 
-    script = os.environ.get("ALBUM_WARM_THUMBS", "").strip()
+    # 公开仓不写本机路径；部署时用环境变量指向宿主机脚本
+    script = (os.environ.get("ALBUM_WARM_THUMBS") or "").strip()
     if not script or not os.path.isfile(script):
         return
     try:

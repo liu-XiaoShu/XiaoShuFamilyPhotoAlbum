@@ -6,13 +6,13 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-v3.0.9-0e9fbf?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-v3.0.11-0e9fbf?style=flat-square" />
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square" />
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20Raspberry%20Pi-informational?style=flat-square" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
 </p>
 
-**作者：** xiaoshu · **邮箱：** [liu_xiaoshu@163.com](mailto:liu_xiaoshu@163.com) · **版本：** v3.0.9（更新时间 2026-10-25）
+**作者：** xiaoshu · **邮箱：** [liu_xiaoshu@163.com](mailto:liu_xiaoshu@163.com) · **版本：** v3.0.11（更新时间 2026-11-01）
 
 把照片和视频按时间整理到本机目录，在浏览器里浏览、编辑、下载，并通过二维码在局域网内分享给家人。适合树莓派 / NAS 一类常开小主机。
 
@@ -20,24 +20,22 @@
 
 ---
 
-## 特性（v3.0.9）
+## 特性（v3.0.11）
 
-- **时光 / 经典 / 地图** 三种浏览；点「搜索」展开检索（标题 / 地点 / 描述 / 感悟 / 文件名）
-- **搜索**：多词空格分词（需同时命中）；支持「仅照片 / 仅视频」；结果可「加载更多」翻完；分享选图同样支持翻页
-- **入库状态**：刷新列表会明确结束提示；入库失败项标红保留，可改完重试；进度与结果用醒目状态条
-- **入库**：拖放或多选；自动解析 EXIF；上传队列（暂停 / 继续 / 重试）；**内容指纹**写入索引，待入库会标出相册里已有的相同内容（忽略元数据，只认画面/视频载荷；重新压缩或改尺寸不算同一份）
-- 无拍摄时间时可从**文件名**回填日期；不要的文件可「移除选中 / 清空待入库」
+- **时光 / 经典 / 地图** 三种浏览；点「搜索」展开检索（标题 / 地点 / 描述 / 感悟 / 文件名；多词分词、翻页、类型过滤）
+- **入库**：拖放或多选；上传后解析 EXIF；**解析范围**可选全部或按张数；**上传队列**；**内容指纹**标出相册已有相同内容；入库/刷新后保留其余项已解析字段
+- **解析保护**：大批量限速 + 指纹缓存，减轻 USB 盘连续猛读掉线
 - **苹果 HEIC / 实况**：原件入库；看图可「实况」预览伴生视频
 - **规范命名**：`年/月/YYYY-MM-DD-HHMMSS-简述-md5.ext`
 - **元数据进文件**：时间、简述、描述、地点写进图片/侧车
-- **看图 / 编辑**：沉浸灯箱；旋转裁剪、视频剪辑封面；下载原文件；部分视频自动转可播格式
+- **看图 / 编辑**：沉浸灯箱；旋转裁剪、视频剪辑封面；**下载原文件**
 - **超级用户 + 分享二维码**：按年份/文件范围授权；可开入库
 - **存储**（超管）：占用与查重分开展示；相册体积来自索引；「重新统计」只重算侧目录，不改照片
 - **访问数据**（超管）：访客曲线、黑名单、入库占比
 - **回收站**软删除（可恢复）；分享访客仅能操作自己可见范围
-- **地图**：国内高德纠偏；港澳台与境外不二次偏移；地点库可增补世界城市
-- **手机**：窄屏浏览布局；幻灯片用清晰预览，画面与视频在上下栏之间铺满并居中
-- **已知不足**：图片旁白未做好（录音与幻灯片出声不稳定），不作为本版可靠功能
+- **SQLite 媒资索引** + 大纲缓存；重建索引不删除照片，并保留内容指纹；地图默认高德在线代理缓存，可切离线包
+- **手机**：幻灯片用清晰预览，画面与视频在上下栏之间铺满并居中
+- **已知不足**：图片旁白未做好；USB 硬盘请保证供电充足
 
 ---
 
@@ -46,13 +44,13 @@
 ### 环境
 
 - Python **3.8+**（Docker 镜像为 3.11）
-- 可选：`ffmpeg`（视频封面/剪辑/可播转码）、`openssl`（自签 HTTPS）
+- 可选：`ffmpeg`（视频封面/剪辑）、`openssl`（自签 HTTPS）
 
 ### 本地运行
 
 ```bash
-git clone https://github.com/liu-XiaoShu/XiaoShuFamilyPhotoAlbum.git
-cd XiaoShuFamilyPhotoAlbum
+git clone <你的仓库地址>.git
+cd 小树时光相册
 
 python3 -m pip install --target .vendor -r requirements.txt
 cp config.example.json config.json
@@ -76,7 +74,6 @@ python3 run.py --http   # 明文 HTTP（仅调试）
 
 ```bash
 cp -n config.example.json config.json
-# 外接盘部署可参考：cp -n config.pi.example.json config.json
 mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 
 ./scripts/pi/deploy.sh    # 构建并启动
@@ -88,9 +85,7 @@ mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 
 等价：`sudo docker-compose up -d --build`
 
-当前部署默认 **HTTPS**。compose 可配置 `HOST_UID` / `HOST_GID`（改成你的宿主机用户 id），便于新写入文件归属正确。相册放到外接盘时，**待入库请与相册同盘**，避免入库时跨盘拷贝。
-
-仓库里的 `docker-compose.yml` / `docker-compose.pi.yml` 使用示例路径 `/mnt/album-data`，部署时请改成你自己的挂载点。
+当前部署默认 **HTTPS**（`CMD python run.py`）。compose 可配置 `HOST_UID` / `HOST_GID`，便于新写入文件归属宿主机用户。
 
 ---
 
@@ -98,7 +93,7 @@ mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 
 | 文档 | 内容 |
 |------|------|
-| [doc/版本说明.md](./doc/版本说明.md) | **v3.0.9 更新范围（含 v3.0.9 / v3.0.0 / v2.1.0 / v2.0.0）** |
+| [doc/版本说明.md](./doc/版本说明.md) | **v3.0.11 更新范围（含既有版本对照）** |
 | [doc/使用说明.md](./doc/使用说明.md) | 日常：入库、浏览、搜索、下载、分享、存储与去重 |
 | [doc/部署使用说明.md](./doc/部署使用说明.md) | Docker、一键脚本、启停、重置密码、备份 |
 | [doc/设计需求.md](./doc/设计需求.md) | 产品目标、架构、版本决策 |
@@ -109,23 +104,19 @@ mkdir -p album inbox data/thumbs data/brand data/map_pack data/geo
 ## 目录结构
 
 ```text
-XiaoShuFamilyPhotoAlbum/
+小树时光相册/
 ├── app/                 # FastAPI 后端 + 静态前端
 ├── doc/                 # 产品与运维文档
 ├── scripts/pi/          # 一键部署 / 启动 / 重启 / 调试
-├── scripts/seed_places.py         # 国内地点库
-├── scripts/seed_world_places.py   # 海外地点增补
 ├── album/               # 相册根（含隐藏目录 .trash 回收站）
 ├── inbox/               # 待入库
 ├── data/
-│   ├── geo/             # 地点库 places.sqlite（运行时生成）
+│   ├── geo/             # 地点库 places.sqlite
 │   ├── map_pack/        # 离线地图说明（瓦片不入库）
 │   └── …                # auth / visitors / thumbs / brand / certs（运行时）
 ├── config.example.json
-├── config.pi.example.json   # 外接盘路径示例（可改）
 ├── Dockerfile
-├── docker-compose.yml       # 外接盘示例（路径请改）
-├── docker-compose.pi.yml
+├── docker-compose.yml
 ├── requirements.txt
 └── run.py
 ```
@@ -133,18 +124,18 @@ XiaoShuFamilyPhotoAlbum/
 ### 请勿提交（已在 `.gitignore`）
 
 - `config.json`、`album/`、`inbox/` 媒资
-- `data/auth.sqlite`、`data/visitors.sqlite`、`data/geo/*.sqlite`
+- `data/auth.sqlite`、`data/visitors.sqlite`
 - `data/brand/`、`data/certs/`、`data/thumbs/`、地图瓦片缓存
 
-公开仓库请用干净克隆；**不要**把家庭照片、访客 IP、超管库、本机绝对路径、账号口令推上 Git。
+公开仓库请用干净克隆；**不要**把家庭照片、访客 IP、超管库推上 GitHub。
 
 ---
 
 ## 使用流程（简）
 
 1. 创建超级用户并登录（默认进入**时光**浏览）  
-2. **管理 → 入库**：选择/拖入 → 自动解析 → 可编辑后「入库选中项」；不要的用「移除选中」  
-3. **浏览**：时光 / 经典 / 地图；需要时点「搜索」（多词空格、可加载更多）；看图可「下载 / 实况 / 编辑」  
+2. **管理 → 入库**：选择/拖入 → **自动解析** → 可编辑后「入库选中项」  
+3. **浏览**：时光 / 经典 / 地图；需要时点「搜索」；看图可「下载 / 实况 / 编辑」  
 4. **管理 → 存储**（超管）：看磁盘占用；「检查重复项」并处理  
 5. **设置**：品牌、主题、地图、分享二维码  
 6. **访问数据**：访客与入库占比（超管）  
@@ -167,11 +158,9 @@ XiaoShuFamilyPhotoAlbum/
 
 ## 许可证
 
-本项目采用 [MIT License](./LICENSE)。
+作者 **xiaoshu** · 版本 **v3.0.8** · 更新时间 **2026-10-11**  
 
-Copyright (c) 2026 xiaoshu <liu_xiaoshu@163.com>
-
-作者 **xiaoshu** · 版本 **v3.0.9** · 更新时间 **2026-10-25**
+默认按个人/家庭自用分发。若对外开源，请自行补充 `LICENSE` 文件。
 
 ---
 

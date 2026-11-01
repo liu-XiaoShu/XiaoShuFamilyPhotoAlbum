@@ -8,9 +8,14 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      # 相册 / 缩略图 / data 建议放同一块数据盘，入库可用 rename
+      # 1T 盘：相册原图、数据库、缩略图
+      # 离线地图原本在 SSD。这块盘已读不出，挂上会导致相册启动失败，先不挂。
+      # 盘恢复后再加回：
+      # - /mnt/album-ssd/map_pack:/app/data/map_pack
+      # - /mnt/album-ssd/map_pack:/mnt/album-data/data/map_pack
       - /mnt/album-data:/mnt/album-data
       - /mnt/album-data/data:/app/data
+      # 待入库与相册同盘，入库可 rename，避免 SD→USB 整文件拷贝打满 IO/网络
       - /mnt/album-data/inbox:/app/inbox
       - ./config.json:/app/config.json
     command: ["python", "run.py", "--https"]
